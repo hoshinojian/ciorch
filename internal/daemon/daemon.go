@@ -124,10 +124,7 @@ func (d *Daemon) loopRepo(ctx context.Context, repo config.RepoEntry, trigger ch
 func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath string) time.Duration {
 	now := d.Now()
 
-	// 全局建机配额：当前 droplet 数对照上限（互斥锁内做全局快照）
-	quota := d.globalQuota(ctx, now)
-
-	acts, err := d.Engine.Reconcile(ctx, repo, d.DryRun, quota)
+	acts, err := d.Engine.Reconcile(ctx, repo, d.DryRun)
 	if err != nil {
 		d.Log.Printf("[%s] reconcile 失败: %v", repo.Repo, err)
 	}
@@ -136,43 +133,18 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	summary := d.summary(repo, acts)
 	d.Log.Printf("[%s] %s", repo.Repo, summary)
 
-	// 原子写状态
-	d.mu.Lock()
-	states := d.Engine.States
-	d.mu.Unlock()
-	if err := state.Save(statePath, map[string]any{"repos": states}); err != nil {
+	// 原子写状态（锁内深拷贝快照——复审修正 7）
+	if err := state.Save(statePath, map[string]any{"repos": d.Engine.StatesSnapshot()}); err != nil {
 		d.Log.Printf("[%s] 状态持久化失败: %v", repo.Repo, err)
 	}
 	return d.nextInterval(repo, now)
-}
-
-func (d *Daemon) globalQuota(ctx context.Context, now time.Time) *int {
-	accounts := map[string]bool{}
-	for _, r := range d.Cfg.Repos {
-		accounts[d.Cfg.ProfileOf(r).Account] = true
-	}
-	var accs []string
-	for a := range accounts {
-		accs = append(accs, a)
-	}
-	n, err := d.Budget.GlobalCount(ctx, d.Lister, accs)
-	if err != nil {
-		d.Log.Printf("全局配额统计失败（按 0 可用处理，本轮只观察不建）: %v", err)
-		zero := 0
-		return &zero
-	}
-	remaining := d.Cfg.Global.MaxDroplets - n
-	if remaining < 0 {
-		remaining = 0
-	}
-	return &remaining
 }
 
 // active 判定（§3.6.6 poll_active 的条件）：Q>0、冷启在途、有 busy runner
 // 或有未结事故。观察数据拿不到"未结事故"（阶段 5），此处按前三者 + 状态里
 // 有机器处于 remedy。
 func (d *Daemon) active(repo config.RepoEntry) bool {
-	st := d.Engine.States[repo.Repo]
+	st := d.Engine.StatesSnapshot()[repo.Repo]
 	for _, m := range st.Machines {
 		if m.Remedy != "" {
 			return true

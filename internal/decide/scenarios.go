@@ -25,8 +25,8 @@ func firstRunnerID(m *machineView) int64 {
 func hardLifetime(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action)) {
 	for name, m := range views {
 		ms := st.Machines[name]
-		if ms.Bad {
-			continue
+		if ms.Bad || ms.Remedy != "" {
+			continue // 已判死由 handleBadMachines 重发；同轮已有回收动作的不重复发
 		}
 		age := obs.Now.Sub(m.droplet.CreatedAt)
 		if age >= p.MaxLifetime && !m.anyBusy() {

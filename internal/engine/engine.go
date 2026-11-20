@@ -12,8 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/budget"
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
@@ -70,11 +72,16 @@ type Engine struct {
 	// Collector 由 daemon 注入（plan/status 直接观察也走它）；接口化便于测试。
 	Collector Observer
 
-	// States 是各仓决策记忆（daemon 持有并持久化）。
+	// States 是各仓决策记忆（daemon 持有并持久化）。并发安全：每仓一个
+	// goroutine 并发 Reconcile（复审修正 7），读写与快照全部在 mu 内。
 	States map[string]decide.RepoState
 	// OnIncident 是事故回调（阶段 5 接 incident 模块；nil = 仅记日志）。
 	OnIncident func(ctx context.Context, repo string, a decide.Action)
+	// Gate 是全局建机闸门（配额+预算互斥判定，复审修正 8；nil = 不设限，
+	// 仅测试用——daemon 必须注入）。
+	Gate *budget.Gate
 
+	mu       sync.Mutex
 	stateDir string
 }
 
@@ -98,10 +105,9 @@ type Observer interface {
 // SetCollector 注入观察器。
 func (e *Engine) SetCollector(c Observer) { e.Collector = c }
 
-// Reconcile 对一个仓走一轮：observe → decide → budget 分配 → 执行。
-// dryRun = 只观察决策写日志不执行。createBudget 是本轮该仓允许的建机配额
-// （由上层 budget.Allocate 统一分配后传入；nil = 不限）。
-func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bool, createBudget *int) ([]decide.Action, error) {
+// Reconcile 对一个仓走一轮：observe → decide → 执行。
+// dryRun = 只观察决策写日志不执行。建机配额/预算经 Gate 互斥判定（复审修正 8）。
+func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bool) ([]decide.Action, error) {
 	if e.Collector == nil {
 		return nil, fmt.Errorf("collector 未注入")
 	}
@@ -115,36 +121,85 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 		RunnersPerDroplet: p.RunnersPerDroplet,
 		OwnedRunnerRe:     regexp.MustCompile(repo.NamespacePattern(p)),
 	}
-	acts, st := decide.Decide(params, e.States[repo.Repo], obs)
+	e.mu.Lock()
+	state := e.States[repo.Repo]
+	e.mu.Unlock()
+	acts, st := decide.Decide(params, state, obs)
+	e.mu.Lock()
 	e.States[repo.Repo] = st
+	e.mu.Unlock()
 	if dryRun {
 		for _, a := range acts {
 			e.Log.Printf("[%s] dry-run %s: %s", repo.Repo, a.Kind, a.Reason)
 		}
 		return acts, nil
 	}
-	e.execute(ctx, repo, obs, acts, createBudget)
+	e.execute(ctx, repo, obs, acts)
 	return acts, nil
 }
 
+// StatesSnapshot 返回决策记忆的深拷贝（持久化/查询用，锁内拷贝——复审修正 7）。
+func (e *Engine) StatesSnapshot() map[string]decide.RepoState {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]decide.RepoState, len(e.States))
+	for k, v := range e.States {
+		machines := make(map[string]decide.MachineState, len(v.Machines))
+		for mk, mv := range v.Machines {
+			machines[mk] = mv
+		}
+		v.Machines = machines
+		out[k] = v
+	}
+	return out
+}
+
 // execute 按序执行动作；动作隔离（§3.8）：失败记日志/回填，不中断。
-func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe.Obs, acts []decide.Action, createBudget *int) {
+func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe.Obs, acts []decide.Action) {
 	for _, a := range acts {
 		switch a.Kind {
 		case decide.ActCreate:
-			if createBudget != nil && *createBudget <= 0 {
-				e.Log.Printf("[%s] 跳过建机：本轮配额已用尽（场景 F）", repo.Repo)
+			// 全局配额+预算占坑（复审修正 8：Reserve→建机→Commit/Abort，
+			// 判定与建机之间的间隙不会让两仓抢掉同一个名额）
+			if e.Gate != nil {
+				ok, reason := e.Gate.Reserve(ctx, liveDropletPrice(obs))
+				if !ok {
+					qAge := queueAge(obs)
+					e.Log.Printf("[%s] 跳过建机（场景 F）：%s", repo.Repo, reason)
+					if qAge >= 15*time.Minute {
+						e.fireIncident(ctx, repo, decide.Action{Kind: decide.ActIncident, IncidentType: "F",
+							Reason: "配额/预算不足且排队超 15 分钟：" + reason})
+					}
+					continue
+				}
+				if err := e.create(ctx, repo, obs); err != nil {
+					e.Gate.Abort()
+					e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
+					e.mu.Lock()
+					st := e.States[repo.Repo]
+					e.mu.Unlock()
+					if inc, fire := decide.RecordCreateResult(decide.Params{}, &st, time.Now(), err); fire {
+						e.fireIncident(ctx, repo, inc)
+					}
+					e.mu.Lock()
+					e.States[repo.Repo] = st
+					e.mu.Unlock()
+					continue
+				}
+				e.Gate.Commit()
 				continue
 			}
 			if err := e.create(ctx, repo, obs); err != nil {
 				e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
+				e.mu.Lock()
 				st := e.States[repo.Repo]
+				e.mu.Unlock()
 				if inc, fire := decide.RecordCreateResult(decide.Params{}, &st, time.Now(), err); fire {
 					e.fireIncident(ctx, repo, inc)
 				}
+				e.mu.Lock()
 				e.States[repo.Repo] = st
-			} else if createBudget != nil {
-				*createBudget--
+				e.mu.Unlock()
 			}
 		case decide.ActDrain:
 			// 先注销注册，成功后才删机（防 #7 竞态；注销失败本轮放弃删机）
@@ -156,6 +211,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 				e.Log.Printf("[%s] Drain 删机失败: %v", repo.Repo, err)
 				continue
 			}
+			e.recordDeletion(obs, a.DropletID)
 			e.Log.Printf("[%s] 已回收 %s（%s）", repo.Repo, a.DropletName, a.Reason)
 		case decide.ActForceDelete:
 			// 强删：先删 droplet 再清注册（job 已判死/注册从未成功）
@@ -163,6 +219,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 				e.Log.Printf("[%s] 强删失败: %v", repo.Repo, err)
 				continue
 			}
+			e.recordDeletion(obs, a.DropletID)
 			if a.RunnerID != 0 {
 				_ = e.GH.RemoveRunner(ctx, repo.Repo, a.RunnerID)
 			} else if a.RunnerName != "" {
@@ -318,6 +375,42 @@ func hasAnyTag(tags []string, want map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// queueAge 取观察里最老 queued job 年龄（场景 F 升级判据）。
+func queueAge(obs observe.Obs) time.Duration {
+	var age time.Duration
+	for _, j := range obs.Jobs {
+		if j.Status == "queued" {
+			if a := obs.Now.Sub(j.CreatedAt); a > age {
+				age = a
+			}
+		}
+	}
+	return age
+}
+
+// recordDeletion 删机成功后入账当日花费（复审修正 8：budget.RecordDeletion
+// 此前无人调用，每日预算完全不生效）。
+func (e *Engine) recordDeletion(obs observe.Obs, dropletID string) {
+	if e.Gate == nil {
+		return
+	}
+	for _, d := range obs.Droplets {
+		if d.ID == dropletID {
+			e.Gate.RecordDeletion(obs.Now, d.PriceMonthly, d.CreatedAt)
+			return
+		}
+	}
+}
+
+// liveDropletPrice 取本仓现存机器价作新机近似价（同 profile；无机器=0，
+// Gate 侧用全局任一在册价兜底）。
+func liveDropletPrice(obs observe.Obs) float64 {
+	for _, d := range obs.Droplets {
+		return d.PriceMonthly
+	}
+	return 0
 }
 
 func dropletIP(obs observe.Obs, name string) string {

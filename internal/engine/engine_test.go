@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/hoshinojian/ciorch/internal/budget"
 
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
@@ -148,8 +151,7 @@ func TestExecuteOrderDeleteBeforeCreate(t *testing.T) {
 	st := preloadState(gh, name)
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = st
-	budget := 2
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false, &budget); err != nil {
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.order) < 2 || !strings.HasPrefix(vps.order[0], "delete:") || vps.order[1] != "create" {
@@ -167,7 +169,7 @@ func TestDrainRegistrationFailureKeepsMachine(t *testing.T) {
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false, nil); err != nil {
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.deleted) != 0 {
@@ -188,8 +190,7 @@ func TestActionIsolation(t *testing.T) {
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
-	budget := 2
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false, &budget); err != nil {
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.created) != 1 {
@@ -208,7 +209,7 @@ func TestCreateUserDataLifecycle(t *testing.T) {
 	vps := &fakeVPS{createErr: fmt.Errorf("DO 503")}
 	e := New(cfg, gh, vps, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(&fakeObs{o})
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false, nil); err != nil {
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	files, _ := filepath.Glob(filepath.Join(cfg.StateDir, "cloudinit", "*.yaml"))
@@ -224,7 +225,7 @@ func TestCreateUserDataLifecycle(t *testing.T) {
 	vps2 := &fakeVPS{}
 	e2 := New(testCfg(t), &fakeGH{}, vps2, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e2.SetCollector(&fakeObs{o})
-	if _, err := e2.Reconcile(context.Background(), nmsRepo(), false, nil); err != nil {
+	if _, err := e2.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps2.created) != 1 {
@@ -247,7 +248,7 @@ func TestDryRunExecutesNothing(t *testing.T) {
 	gh := &fakeGH{}
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
-	acts, err := e.Reconcile(context.Background(), nmsRepo(), true, nil)
+	acts, err := e.Reconcile(context.Background(), nmsRepo(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,4 +286,154 @@ func preloadState(gh *fakeGH, name string) decide.RepoState {
 			name: {FirstOnlineAt: tnow.Add(-9 * time.Hour), IdleSince: tnow.Add(-30 * time.Minute)},
 		},
 	}
+}
+
+// 复审修正 7：多仓并发 Reconcile 不炸 map（-race 下跑）。
+func TestConcurrentReposNoRace(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.Repos = []config.RepoEntry{
+		{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2},
+		{Repo: "hoshinojian/web", Profile: "go-heavy", MaxRunners: 2},
+	}
+	obsrv := &fakeObs{observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}}
+	e := New(cfg, &fakeGH{}, &fakeVPS{}, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.SetCollector(obsrv)
+	var wg sync.WaitGroup
+	for _, r := range cfg.Repos {
+		wg.Add(1)
+		go func(repo config.RepoEntry) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := e.Reconcile(context.Background(), repo, true); err != nil {
+					t.Errorf("reconcile: %v", err)
+					return
+				}
+				_ = e.StatesSnapshot() // 模拟 daemon 持久化读
+			}
+		}(r)
+	}
+	wg.Wait()
+}
+
+// 复审修正 8：两仓同时要机、只剩 1 个名额 → 只建 1 台（Gate 互斥）。
+func TestGateSingleSlotTwoRepos(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.Repos = []config.RepoEntry{
+		{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2},
+		{Repo: "hoshinojian/web", Profile: "go-heavy", MaxRunners: 2},
+	}
+	// 全局已有 1 台（max=2，剩 1 名额）；list 反映 create/delete
+	cl := &cluster{droplets: []vpsctlapi.Droplet{{Account: "team2-ci", ID: "9", Name: "ci-x-team2-ci-sgp1-01", PriceMonthly: 141}}}
+	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
+	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate.Now = func() time.Time { return tnow }
+
+	e := New(cfg, &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.Gate = gate
+	// 两仓并发各跑一轮（每仓 Q=3 会想建 2 台；全局只剩 1 名额）
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}, {ID: 2, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}, {ID: 3, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	e.SetCollector(&fakeObs{o})
+	var wg sync.WaitGroup
+	for _, r := range cfg.Repos {
+		wg.Add(1)
+		go func(repo config.RepoEntry) {
+			defer wg.Done()
+			if _, err := e.Reconcile(context.Background(), repo, false); err != nil {
+				t.Errorf("reconcile: %v", err)
+			}
+		}(r)
+	}
+	wg.Wait()
+	if cl.created > 1 {
+		t.Fatalf("只剩 1 名额，两仓并发只允许建 1 台，got %d", cl.created)
+	}
+}
+
+// 复审修正 8：预算不足 → 不建并产生场景 F 事故（QAge≥15m）。
+func TestGateBudgetDenialIncidentF(t *testing.T) {
+	cfg := testCfg(t)
+	// 已有机器花掉了预算：1 台 141/672×2h≈0.42，日预算 0.5 → 新机 1 小时 0.21 会超
+	cl := &cluster{droplets: []vpsctlapi.Droplet{{Account: "team2-ci", ID: "9", Name: "ci-x-team2-ci-sgp1-01", PriceMonthly: 141, CreatedAt: tnow.Add(-2 * time.Hour)}}}
+	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 0.5}
+	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate.Now = func() time.Time { return tnow }
+
+	incidents := []decide.Action{}
+	e := New(cfg, &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.Gate = gate
+	e.OnIncident = func(ctx context.Context, repo string, a decide.Action) { incidents = append(incidents, a) }
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-16 * time.Minute)}}
+	e.SetCollector(&fakeObs{o})
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) == 0 || incidents[0].IncidentType != "F" {
+		t.Fatalf("预算不足 + QAge≥15m 应开 F 事故：%v", incidents)
+	}
+}
+
+// 复审修正 8：Drain 删机成功 → Gate 入账（SpentToday 反映）。
+func TestDrainRecordsDeletionToBudget(t *testing.T) {
+	name := "ci-nms-team2-ci-sgp1-01"
+	cl := &cluster{}
+	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
+	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate.Now = func() time.Time { return tnow }
+
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour), PriceMonthly: 141}}
+	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
+	e := New(testCfg(t), &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.Gate = gate
+	e.SetCollector(&fakeObs{o})
+	e.States[nmsRepo().Repo] = preloadState(nil, name)
+	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(cl.deleted) != 1 {
+		t.Fatalf("硬寿命应删机（同轮去重后恰好一次）：%v", cl.deleted)
+	}
+	if b.SpentToday(tnow, nil) <= 0 {
+		t.Fatal("删机应入账当日花费（budget.RecordDeletion 此前无人调用）")
+	}
+}
+
+// cluster 模拟 DO 全局状态：list 反映 create/delete（并发安全）——
+// 现实中 vpsctl list 会立刻见到新机器，闸门才数得准。
+type cluster struct {
+	mu       sync.Mutex
+	droplets []vpsctlapi.Droplet
+	created  int
+	deleted  []string
+}
+
+func (c *cluster) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]vpsctlapi.Droplet(nil), c.droplets...), nil
+}
+
+func (c *cluster) Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.created++
+	d := vpsctlapi.Droplet{Account: o.Account, ID: fmt.Sprintf("new-%d", c.created), Name: "ci-nms-team2-ci-sgp1-09", PriceMonthly: 141}
+	c.droplets = append(c.droplets, d)
+	return d, nil
+}
+
+func (c *cluster) Delete(ctx context.Context, account, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleted = append(c.deleted, id)
+	var out []vpsctlapi.Droplet
+	for _, d := range c.droplets {
+		if d.ID != id {
+			out = append(out, d)
+		}
+	}
+	c.droplets = out
+	return nil
 }

@@ -153,7 +153,7 @@ func cmdPlan(configPath, token, repoFilter string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	for _, r := range reposOf(cfg, repoFilter) {
-		acts, err := e.Reconcile(ctx, r, true, nil) // dry-run：只决策打印
+		acts, err := e.Reconcile(ctx, r, true) // dry-run：只决策打印
 		if err != nil {
 			return err
 		}
@@ -227,6 +227,15 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	_ = collector
 	vps := vpsctlapi.NewClient(cfg.VPSctlBin, cfg.VPSctlAccountsFile)
 	b := &budget.Budget{MaxDroplets: cfg.Global.MaxDroplets, DailyBudgetUSD: cfg.Global.DailyBudgetUSD}
+	accounts := map[string]bool{}
+	for _, r := range cfg.Repos {
+		accounts[cfg.ProfileOf(r).Account] = true
+	}
+	var accs []string
+	for a := range accounts {
+		accs = append(accs, a)
+	}
+	e.Gate = budget.NewGate(b, vps, accs) // 全局配额+预算互斥闸门（复审修正 8）
 	d := daemon.New(cfg, e, b, vps, log.Default())
 	if dryRun {
 		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")
