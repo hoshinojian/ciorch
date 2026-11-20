@@ -91,6 +91,33 @@ func TestColdStartProxyFirstSeenRunner(t *testing.T) {
 	}
 }
 
+// 名字复用不算同一台机器：删机重建后 vpsctl 从 01 重新计数、名字相同但
+// runner_id 是新注册。冷启代理必须按 id 区分（2026-11-20 实测：
+// cirunner-team2-ci-sgp1-01 一名下 14 个 id）。
+func TestColdStartProxyNameReusedDifferentRunnerID(t *testing.T) {
+	runs := []Run{
+		{CreatedAt: t0, Jobs: []Job{
+			// 机器 A（id 23）首 job：排队 4m（含冷启）
+			{ID: 1, Name: "lint", CreatedAt: t0, StartedAt: t0.Add(4 * time.Minute), RunnerID: 23, RunnerName: "cirunner-team2-ci-sgp1-01"},
+		}},
+		{CreatedAt: t0.Add(time.Hour), Jobs: []Job{
+			// 机器 B（id 24）与 A 同名：首 job 排队 5m 也应算冷启
+			{ID: 2, Name: "lint", CreatedAt: t0.Add(time.Hour), StartedAt: t0.Add(time.Hour + 5*time.Minute), RunnerID: 24, RunnerName: "cirunner-team2-ci-sgp1-01"},
+		}},
+		{CreatedAt: t0.Add(2 * time.Hour), Jobs: []Job{
+			// 机器 B 第二个 job：热机，不算冷启
+			{ID: 3, Name: "test", CreatedAt: t0.Add(2 * time.Hour), StartedAt: t0.Add(2*time.Hour + 30*time.Second), RunnerID: 24, RunnerName: "cirunner-team2-ci-sgp1-01"},
+		}},
+	}
+	rep := Compute("a/b", runs)
+	if rep.ColdStart.Samples != 2 {
+		t.Fatalf("同名不同 id 应算 2 次冷启，got %d", rep.ColdStart.Samples)
+	}
+	if rep.ColdStart.Max != 5*time.Minute {
+		t.Fatalf("冷启 max 应 5m，got %v", rep.ColdStart.Max)
+	}
+}
+
 // run 总时长：max(job completed) - run.created（用 jobs 口径，不依赖 run.updated_at 语义）。
 func TestRunTotalFromJobs(t *testing.T) {
 	h := time.Hour
