@@ -230,6 +230,7 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	d := daemon.New(cfg, e, b, vps, log.Default())
 	if dryRun {
 		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")
+		d.DryRun = true // 透传到每轮 Reconcile——此前只打印提示仍是真执行（审查修正 1）
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

@@ -17,6 +17,31 @@ func firstRunnerID(m *machineView) int64 {
 	return 0
 }
 
+// hardLifetime：年龄 ≥ MaxLifetime 且 busy=false → Drain（观察不完整也执行，
+// 防成本泄漏——但要求 droplets 一路成功，由调用方保证）；≥ MaxLifetime+2h
+// 无论忙闲 → 告警（场景 D 变体）。busy 判定用 runner 现值（冻结路径无
+// MachineState 可查时不误判——无 runner 视为不忙，回收窗口成立）。
+func hardLifetime(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action)) {
+	for name, m := range views {
+		ms := st.Machines[name]
+		if ms.Bad {
+			continue
+		}
+		age := obs.Now.Sub(m.droplet.CreatedAt)
+		if age >= p.MaxLifetime && !m.anyBusy() {
+			ms.Remedy, ms.RemedyAt = "draining", obs.Now
+			st.Machines[name] = ms
+			emit(Action{
+				Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+				Reason: "硬寿命到期：机器年龄超上限且回收窗口（观察不完整也执行，防成本泄漏）",
+			})
+		} else if age >= p.MaxLifetime+lifetimeOverrunAlert {
+			emit(Action{Kind: ActIncident, IncidentType: "D", IncidentKey: name,
+				Reason: "机器年龄超硬寿命+2h 仍在忙（场景 D 变体，需人工介入）"})
+		}
+	}
+}
+
 // scenarioC 掉线：曾 online、当前 offline（或注册消失）连续 OfflineSamples 轮
 // → 先建后拆（同 B），不计熔断；同仓 24h 内第 2 次 → 事故。
 func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
@@ -290,26 +315,8 @@ func scaling(p Params, st *RepoState, obs observe.Obs, views map[string]*machine
 		}
 	}
 
-	// 硬寿命：年龄 ≥ MaxLifetime 且 busy=false → Drain（Complete=false 也执行，
-	// 防成本泄漏）；≥ MaxLifetime+2h 无论忙闲 → 告警（场景 D 变体）。
-	for name, m := range views {
-		ms := st.Machines[name]
-		if ms.Bad {
-			continue
-		}
-		age := obs.Now.Sub(m.droplet.CreatedAt)
-		if age >= p.MaxLifetime && !m.anyBusy() {
-			ms.Remedy, ms.RemedyAt = "draining", obs.Now
-			st.Machines[name] = ms
-			emit(Action{
-				Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
-				Reason: "硬寿命到期：机器年龄超上限且回收窗口（观察不完整也执行，防成本泄漏）",
-			})
-		} else if age >= p.MaxLifetime+lifetimeOverrunAlert {
-			emit(Action{Kind: ActIncident, IncidentType: "D", IncidentKey: name,
-				Reason: "机器年龄超硬寿命+2h 仍在忙（场景 D 变体，需人工介入）"})
-		}
-	}
+	// 硬寿命（拆出为独立函数，冻结路径与正常路径共用）
+	hardLifetime(p, st, obs, views, emit)
 
 	// 扩容：want = ceil(clamp(Q-I-P, 0, (max_runners-N)*rpd) / rpd)，
 	// 再受熔断（open 不建 / half-open 只 1 台试探）与建机退避约束。

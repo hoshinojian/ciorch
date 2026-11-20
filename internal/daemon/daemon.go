@@ -35,6 +35,8 @@ type Daemon struct {
 	Log                  *log.Logger
 	PollActive, PollIdle time.Duration
 	Now                  Clock
+	// DryRun = shadow 模式：只观察与决策，不执行任何动作（§3.8）。
+	DryRun bool
 
 	mu       sync.Mutex
 	triggers map[string]chan struct{}
@@ -125,7 +127,7 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	// 全局建机配额：当前 droplet 数对照上限（互斥锁内做全局快照）
 	quota := d.globalQuota(ctx, now)
 
-	acts, err := d.Engine.Reconcile(ctx, repo, false, quota)
+	acts, err := d.Engine.Reconcile(ctx, repo, d.DryRun, quota)
 	if err != nil {
 		d.Log.Printf("[%s] reconcile 失败: %v", repo.Repo, err)
 	}

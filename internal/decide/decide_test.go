@@ -16,7 +16,9 @@ func params() Params {
 	return Params{MaxRunners: 2, RunnersPerDroplet: 1, OwnedRunnerRe: ownedRe}
 }
 
-func obs() observe.Obs { return observe.Obs{Now: t0, Complete: true} }
+func obs() observe.Obs {
+	return observe.Obs{Now: t0, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+}
 
 func droplet(name string, age time.Duration) observe.Droplet {
 	return observe.Droplet{ID: "d-" + name, Name: name, CreatedAt: t0.Add(-age), PriceMonthly: 141}
@@ -217,9 +219,10 @@ func TestTeardownOnePerRound(t *testing.T) {
 
 func TestHardLifetime(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
-	// 8h 空闲 → 删（观察不完整也删）
+	// 8h 空闲 → 删（观察不完整也删——但 droplets 路必须成功）
 	o := obs()
 	o.Complete = false
+	o.JobsOK = false
 	o.Droplets = []observe.Droplet{droplet(name, 8*time.Hour+time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-8 * time.Hour), IdleSince: t0.Add(-time.Hour)}}}

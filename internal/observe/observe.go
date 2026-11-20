@@ -44,8 +44,12 @@ type Droplet struct {
 
 // Obs 是一轮观察（§3.5 结构）。
 type Obs struct {
-	Now             time.Time
-	Complete        bool // 三路观察（runs+jobs / runners / droplets）全部成功
+	Now      time.Time
+	Complete bool // 三路观察（runs+jobs / runners / droplets）全部成功
+	// 分路成败（观察冻结判据：哪一路失败冻结哪一路的行为，REDESIGN §2.2.7）
+	JobsOK          bool
+	RunnersOK       bool
+	DropletsOK      bool
 	Jobs            []Job
 	UnmatchedQueued []Job // labels 无法被 profile 满足的 queued job（场景 E）
 	Runners         []Runner
@@ -135,10 +139,11 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 	if c.Now != nil {
 		now = c.Now()
 	}
-	obs := Obs{Now: now, Complete: true}
+	obs := Obs{Now: now, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
 	var firstErr error
-	fail := func(err error) {
+	fail := func(err error, leg *bool) {
 		obs.Complete = false
+		*leg = false
 		if firstErr == nil {
 			firstErr = err
 		}
@@ -147,7 +152,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 	byID := map[int64]Job{}
 	runs, err := c.GH.ListRuns(ctx, repo, now.Add(-24*time.Hour))
 	if err != nil {
-		fail(err)
+		fail(err, &obs.JobsOK)
 	} else {
 		for _, run := range runs {
 			if run.Status == "completed" {
@@ -155,7 +160,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 			}
 			jobs, err := c.GH.ListJobs(ctx, repo, run.ID)
 			if err != nil {
-				fail(err)
+				fail(err, &obs.JobsOK)
 				break
 			}
 			for _, j := range jobs {
@@ -191,7 +196,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 
 	ghRunners, err := c.GH.ListRunners(ctx, repo)
 	if err != nil {
-		fail(err)
+		fail(err, &obs.RunnersOK)
 	} else {
 		for _, gr := range ghRunners {
 			obs.Runners = append(obs.Runners, Runner{
@@ -202,7 +207,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 
 	droplets, err := c.VPS.ListDroplets(ctx, r.Tag(), p.Account)
 	if err != nil {
-		fail(err)
+		fail(err, &obs.DropletsOK)
 	} else {
 		obs.Droplets = droplets
 	}

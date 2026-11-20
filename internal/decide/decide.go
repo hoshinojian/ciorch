@@ -235,6 +235,21 @@ func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 	var acts []Action
 	emit := func(a Action) { acts = append(acts, a) }
 
+	// 观察不完整：整轮冻结（REDESIGN §2.2.7 修订版——原"只建不删"在 droplets
+	// 一路缺失时会超建，冻结更安全）。只累计场景 H；droplets 一路成功时仍执行
+	// 硬寿命回收（防成本泄漏）；不建、不删（硬寿命除外）、不 ssh、不推进任何
+	// 采样计数、不清理 Machines 记忆。
+	if !obs.Complete {
+		scenarioH(p, &st, obs, emit)
+		if obs.DropletsOK {
+			syncMachines(&st, obs)
+			views := buildViewsFrozen(obs)
+			hardLifetime(p, &st, obs, views, emit)
+		}
+		sort.SliceStable(acts, func(i, j int) bool { return actRank(acts[i]) < actRank(acts[j]) })
+		return acts, st
+	}
+
 	Q, QAge := demand(obs)
 	recordActivity(&st, obs)
 	syncMachines(&st, obs)
@@ -261,6 +276,15 @@ func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 
 	sort.SliceStable(acts, func(i, j int) bool { return actRank(acts[i]) < actRank(acts[j]) })
 	return acts, st
+}
+
+// buildViewsFrozen 组装只读视图（不更新任何机器状态——冻结轮专用）。
+func buildViewsFrozen(obs observe.Obs) map[string]*machineView {
+	views := map[string]*machineView{}
+	for _, d := range obs.Droplets {
+		views[d.Name] = &machineView{name: d.Name, droplet: d}
+	}
+	return views
 }
 
 func actRank(a Action) int {
