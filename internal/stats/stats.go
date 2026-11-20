@@ -2,9 +2,13 @@
 // 输出排队等待、冷启代理、run 总时长的统计报告。无 IO、不读时钟。
 //
 // 口径（docs/REDESIGN.md §9 阶段 1）：
-//   - 排队等待 = job started_at - created_at（仅计入已开跑的 job）
-//   - 冷启代理 = 窗口内 runner 名首次出现的那个 job 的排队等待（含建机时间上界）
-//   - run 总时长 = max(job completed_at) - run created_at（不依赖 run.updated_at 语义）
+//   - 排队等待 = job started_at - created_at（仅计入已开跑且非重跑失真的 job）
+//   - 冷启代理 = 窗口内 runner 注册 id 首次出现的那个 job 的排队等待（含建机时间上界）
+//   - run 总时长 = max(job completed_at) - run_started_at（最新 attempt 起点；
+//     缺 run_started_at 时退回 created_at）
+//   - 重跑失真（filter=latest 的已知行为）：未被重跑的 job 保留第一次 attempt 的
+//     started_at，created_at 却刷新为新 attempt 时间 → started < created 为负，
+//     计入 RerunExcludedJobs，不进任何样本
 //   - 分位数 = nearest-rank（ceil(p/100·N)，确定性、无插值歧义）
 package stats
 
@@ -17,9 +21,11 @@ import (
 
 // Run 是一个 workflow run 及其全部 job（GitHub 侧事实，filter=latest 口径）。
 type Run struct {
-	ID        int64
-	CreatedAt time.Time
-	Jobs      []Job
+	ID           int64
+	RunAttempt   int // 1 = 原始；>1 = 重跑（rerun-failed-jobs 后的最新 attempt）
+	CreatedAt    time.Time
+	RunStartedAt time.Time // 最新 attempt 的开始时间；零值 = 未知（退回 CreatedAt）
+	Jobs         []Job
 }
 
 // Job 是 jobs 接口的一个 job 快照。
@@ -50,17 +56,21 @@ type ColdStart struct {
 
 // Report 是一个仓一个窗口的统计报告。
 type Report struct {
-	Repo         string
-	Runs         int
-	JobsStarted  int
-	QueueWaitP50 time.Duration
-	QueueWaitP95 time.Duration
-	QueueWaitMax time.Duration
-	RunTotalP50  time.Duration
-	RunTotalP95  time.Duration
-	RunTotalMax  time.Duration
-	ColdStart    ColdStart
-	ByJob        map[string]JobStat
+	Repo        string
+	Runs        int
+	RerunRuns   int // run_attempt > 1 的 run 数
+	JobsStarted int // 有效排队样本数（不含重跑排除）
+	// RerunExcludedJobs 是因重跑 started_at<created_at 而排除的 job 数
+	// （filter=latest 下未被重跑的 job 保留旧 attempt 的 started_at）。
+	RerunExcludedJobs int
+	QueueWaitP50      time.Duration
+	QueueWaitP95      time.Duration
+	QueueWaitMax      time.Duration
+	RunTotalP50       time.Duration
+	RunTotalP95       time.Duration
+	RunTotalMax       time.Duration
+	ColdStart         ColdStart
+	ByJob             map[string]JobStat
 }
 
 // Compute 计算统计报告。runs 顺序任意（内部按时间排序后统计）。
@@ -81,22 +91,30 @@ func Compute(repo string, runs []Run) Report {
 			continue
 		}
 		rep.Runs++
+		if r.RunAttempt > 1 {
+			rep.RerunRuns++
+		}
 		var lastDone time.Time
 		for _, j := range r.Jobs {
 			if !j.StartedAt.IsZero() {
-				w := j.StartedAt.Sub(j.CreatedAt)
-				queueWaits = append(queueWaits, w)
-				perJob[j.Name] = append(perJob[j.Name], w)
-				rep.JobsStarted++
-				// 冷启代理按 runner 注册身份判"新机器"：优先 runner_id（删机
-				// 重建后名字会复用，id 不会）；id 缺失时退回名字（不重数即漏数）。
-				key := j.RunnerName
-				if j.RunnerID != 0 {
-					key = fmt.Sprintf("id:%d", j.RunnerID)
-				}
-				if key != "" && !seenRunner[key] {
-					seenRunner[key] = true
-					coldWaits = append(coldWaits, w)
+				if j.StartedAt.Before(j.CreatedAt) {
+					// 重跑失真：旧 attempt 的 started_at + 新 attempt 的 created_at。
+					rep.RerunExcludedJobs++
+				} else {
+					w := j.StartedAt.Sub(j.CreatedAt)
+					queueWaits = append(queueWaits, w)
+					perJob[j.Name] = append(perJob[j.Name], w)
+					rep.JobsStarted++
+					// 冷启代理按 runner 注册身份判"新机器"：优先 runner_id（删机
+					// 重建后名字会复用，id 不会）；id 缺失时退回名字（不重数即漏数）。
+					key := j.RunnerName
+					if j.RunnerID != 0 {
+						key = fmt.Sprintf("id:%d", j.RunnerID)
+					}
+					if key != "" && !seenRunner[key] {
+						seenRunner[key] = true
+						coldWaits = append(coldWaits, w)
+					}
 				}
 			}
 			if j.CompletedAt.After(lastDone) {
@@ -104,7 +122,13 @@ func Compute(repo string, runs []Run) Report {
 			}
 		}
 		if !lastDone.IsZero() {
-			runTotals = append(runTotals, lastDone.Sub(r.CreatedAt))
+			start := r.RunStartedAt
+			if start.IsZero() {
+				start = r.CreatedAt
+			}
+			if d := lastDone.Sub(start); d > 0 {
+				runTotals = append(runTotals, d)
+			}
 		}
 	}
 

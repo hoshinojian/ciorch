@@ -1,6 +1,9 @@
 // Package config 加载并校验 ciorch 配置。
-// 阶段 1 只承载 stats 所需子集（repos + token 源）；完整 schema 见
-// docs/REDESIGN.md §3.3，随阶段 2 决策核心落地。
+// schema 对齐 docs/REDESIGN.md §3.3：repos 为对象数组。阶段 1 只解析并校验
+// repo 字段（stats 只需要它）；profile/max_runners/issue_repo 等字段随阶段 2
+// 决策核心实现时加入——未知字段一律拒绝（DisallowUnknownFields），理由：
+// 调度参数拼错键名而静默走默认值（如 max_runners→1）的风险，大于失去的
+// 前向兼容（本仓配置与二进制同版本演进，不存在旧二进制读新配置的场景）。
 package config
 
 import (
@@ -11,10 +14,15 @@ import (
 	"regexp"
 )
 
+// RepoEntry 是一个托管仓的配置（阶段 1 仅 repo 字段，其余阶段 2 落地）。
+type RepoEntry struct {
+	Repo string `json:"repo"`
+}
+
 // Config 是阶段 1 配置子集。
 type Config struct {
-	// Repos 是托管的仓列表（owner/name）。
-	Repos []string `json:"repos"`
+	// Repos 是托管的仓列表（对象数组，§3.3）。
+	Repos []RepoEntry `json:"repos"`
 	// TokenFile 是 GitHub token 文件路径；空 = 走环境变量/gh auth token 兜底。
 	TokenFile string `json:"token_file"`
 }
@@ -28,7 +36,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
 	}
 	var c Config
-	if err := json.Unmarshal(raw, &c); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
 	}
 	if len(c.Repos) == 0 {
@@ -36,13 +46,13 @@ func Load(path string) (*Config, error) {
 	}
 	seen := map[string]bool{}
 	for i, r := range c.Repos {
-		if !repoRe.MatchString(r) {
-			return nil, fmt.Errorf("repos[%d]：%q 不是 owner/name 形式", i, r)
+		if !repoRe.MatchString(r.Repo) {
+			return nil, fmt.Errorf("repos[%d].repo：%q 不是 owner/name 形式", i, r.Repo)
 		}
-		if seen[r] {
-			return nil, fmt.Errorf("repos[%d]：%q 重复", i, r)
+		if seen[r.Repo] {
+			return nil, fmt.Errorf("repos[%d].repo：%q 重复", i, r.Repo)
 		}
-		seen[r] = true
+		seen[r.Repo] = true
 	}
 	return &c, nil
 }
