@@ -147,3 +147,74 @@ func Allocate(globalCount, maxDroplets int, reqs []Request) Allocation {
 	}
 	return out
 }
+
+// Gate 是全局建机闸门（复审修正 8）：把"全局配额 + 每日预算判定 + 删机入账"
+// 放进同一互斥区间——多仓并发时不会同时抢掉最后一个名额，也不会漏记账。
+type Gate struct {
+	mu       sync.Mutex
+	B        *Budget
+	Lister   Lister
+	Accounts []string
+	// Now 可注入时钟（测试）；默认 time.Now。
+	Now func() time.Time
+	// inflight 是已 Reserve 未 Commit/Abort 的建机数——Allow 与实际建机
+	// 之间有间隙（TOCTOU：两仓并发都通过检查再各自建，超配额），占坑记数。
+	inflight int
+}
+
+// NewGate 构造。
+func NewGate(b *Budget, l Lister, accounts []string) *Gate {
+	return &Gate{B: b, Lister: l, Accounts: accounts, Now: time.Now}
+}
+
+// Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口）：判定配额+预算并计入
+// 在途，建机调用方成功后 Commit、失败后 Abort。价 price=0 时用全局在册价近似。
+func (g *Gate) Reserve(ctx context.Context, price float64) (bool, string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	live := map[string]vpsctlapi.Droplet{}
+	for _, acc := range g.Accounts {
+		ds, err := g.Lister.ListByTag(ctx, "ciorch", acc)
+		if err != nil {
+			return false, fmt.Sprintf("全局列机失败（保守拒绝）: %v", err)
+		}
+		for _, d := range ds {
+			live[d.ID] = d
+		}
+	}
+	var liveList []vpsctlapi.Droplet
+	for _, d := range live {
+		liveList = append(liveList, d)
+	}
+	count := len(live) + g.inflight
+	if price == 0 && len(liveList) > 0 {
+		price = liveList[0].PriceMonthly // 同 profile 近似价
+	}
+	ok, reason := g.B.CanCreate(g.Now(), count, liveList, price)
+	if !ok {
+		return false, reason
+	}
+	g.inflight++
+	return true, ""
+}
+
+// Commit 建机成功：释放占坑（机器随后出现在 list 里）。
+func (g *Gate) Commit() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
+
+// Abort 建机失败：释放占坑。
+func (g *Gate) Abort() {
+	g.mu.Lock()
+	g.inflight--
+	g.mu.Unlock()
+}
+
+// RecordDeletion 删机入账（互斥）。
+func (g *Gate) RecordDeletion(now time.Time, price float64, created time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.B.RecordDeletion(now, vpsctlapi.Droplet{PriceMonthly: price, CreatedAt: created})
+}
