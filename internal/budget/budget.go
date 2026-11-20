@@ -58,6 +58,29 @@ func (b *Budget) GlobalCount(ctx context.Context, lister Lister, accounts []stri
 	return len(seen), nil
 }
 
+// Snapshot 导出当日累计（持久化用——此前只在内存，守护重启当日花费清零）。
+type BudgetSnapshot struct {
+	DayUTC     string  `json:"day_utc"`
+	SpentToday float64 `json:"spent_today"`
+}
+
+func (b *Budget) Snapshot(now time.Time) BudgetSnapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollover(now)
+	return BudgetSnapshot{DayUTC: b.dayUTC, SpentToday: b.spentToday}
+}
+
+// Restore 恢复当日累计（同日才恢复；跨日自然清零）。
+func (b *Budget) Restore(now time.Time, snap BudgetSnapshot) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.rollover(now)
+	if snap.DayUTC == b.dayUTC {
+		b.spentToday = snap.SpentToday
+	}
+}
+
 // rollover 跨 UTC 自然日清零（§3.7）。
 func (b *Budget) rollover(now time.Time) {
 	day := now.UTC().Format("2006-01-02")
@@ -157,9 +180,10 @@ type Gate struct {
 	Accounts []string
 	// Now 可注入时钟（测试）；默认 time.Now。
 	Now func() time.Time
-	// inflight 是已 Reserve 未 Commit/Abort 的建机数——Allow 与实际建机
-	// 之间有间隙（TOCTOU：两仓并发都通过检查再各自建，超配额），占坑记数。
-	inflight int
+	// pending 是在途占坑（Reserve 计入、Commit 后携带 droplet 名保留到
+	// 列表可见/TTL——vpsctl list 见到新机有秒级延迟，过早释放会让别的仓
+	// 在窗口内多占一个名额）。
+	pending []gatePending
 }
 
 // NewGate 构造。
@@ -167,16 +191,31 @@ func NewGate(b *Budget, l Lister, accounts []string) *Gate {
 	return &Gate{B: b, Lister: l, Accounts: accounts, Now: time.Now}
 }
 
+// Reservation 是一次占坑句柄：建机成功后 Commit（携带 droplet 名，占坑
+// 保留到该机器出现在全局列表里或 TTL 到期——vpsctl list 见到新机有秒级
+// 延迟，过早释放会让别的仓在窗口内多占一个名额）；失败 Abort。
+type Reservation struct {
+	id int
+}
+
+type gatePending struct {
+	name string // 建机成功后的 droplet 名（空 = 未完成）
+	at   time.Time
+}
+
+// gateTTL 是未出现在列表里的占坑最长保留时间（保守兜底）。
+const gateTTL = 2 * time.Minute
+
 // Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口）：判定配额+预算并计入
 // 在途，建机调用方成功后 Commit、失败后 Abort。价 price=0 时用全局在册价近似。
-func (g *Gate) Reserve(ctx context.Context, price float64) (bool, string) {
+func (g *Gate) Reserve(ctx context.Context, price float64) (*Reservation, bool, string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	live := map[string]vpsctlapi.Droplet{}
 	for _, acc := range g.Accounts {
 		ds, err := g.Lister.ListByTag(ctx, "ciorch", acc)
 		if err != nil {
-			return false, fmt.Sprintf("全局列机失败（保守拒绝）: %v", err)
+			return nil, false, fmt.Sprintf("全局列机失败（保守拒绝）: %v", err)
 		}
 		for _, d := range ds {
 			live[d.ID] = d
@@ -186,30 +225,57 @@ func (g *Gate) Reserve(ctx context.Context, price float64) (bool, string) {
 	for _, d := range live {
 		liveList = append(liveList, d)
 	}
-	count := len(live) + g.inflight
+	// 清扫：TTL 过期的占坑释放；已命名且出现在列表里的释放（名额由 list 计）
+	kept := g.pending[:0]
+	for _, pnd := range g.pending {
+		if pnd.name != "" {
+			if _, visible := liveByName(live, pnd.name); visible {
+				continue // 已可见：释放占坑
+			}
+		}
+		if g.Now().Sub(pnd.at) > gateTTL {
+			continue // TTL 兜底释放
+		}
+		kept = append(kept, pnd)
+	}
+	g.pending = kept
+	count := len(live) + len(g.pending)
 	if price == 0 && len(liveList) > 0 {
 		price = liveList[0].PriceMonthly // 同 profile 近似价
 	}
 	ok, reason := g.B.CanCreate(g.Now(), count, liveList, price)
 	if !ok {
-		return false, reason
+		return nil, false, reason
 	}
-	g.inflight++
-	return true, ""
+	g.pending = append(g.pending, gatePending{at: g.Now()})
+	return &Reservation{id: len(g.pending) - 1}, true, ""
 }
 
-// Commit 建机成功：释放占坑（机器随后出现在 list 里）。
-func (g *Gate) Commit() {
+// Commit 建机成功：携带 droplet 名占坑保留至列表可见/TTL。
+func (g *Gate) Commit(r *Reservation, dropletName string) {
 	g.mu.Lock()
-	g.inflight--
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	if r != nil && r.id < len(g.pending) {
+		g.pending[r.id].name = dropletName
+	}
 }
 
-// Abort 建机失败：释放占坑。
-func (g *Gate) Abort() {
+// Abort 建机失败：立即释放占坑。
+func (g *Gate) Abort(r *Reservation) {
 	g.mu.Lock()
-	g.inflight--
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	if r != nil && r.id < len(g.pending) {
+		g.pending[r.id].at = time.Time{} // 立即过期，下次 Reserve 清扫
+	}
+}
+
+func liveByName(live map[string]vpsctlapi.Droplet, name string) (vpsctlapi.Droplet, bool) {
+	for _, d := range live {
+		if d.Name == name {
+			return d, true
+		}
+	}
+	return vpsctlapi.Droplet{}, false
 }
 
 // RecordDeletion 删机入账（互斥）。

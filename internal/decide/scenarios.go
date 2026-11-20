@@ -65,9 +65,21 @@ func handleBadMachines(st *RepoState, obs observe.Obs, views map[string]*machine
 			continue
 		}
 		if ms.Remedy == "draining" {
-			// Drain 尝试失败后机器还在：清 Remedy，本轮重新判定（空闲/硬寿命可再发）
-			ms.Remedy, ms.RemedyAt = "", time.Time{}
-			st.Machines[name] = ms
+			if len(m.runners) == 0 {
+				// R7：Drain 已注销成功（注册消失）、droplet 还在（删机延迟/失败）——
+				// 这是回收未完，不是掉线：按 Bad 处理只重发删除，不记 C 事件
+				remedied[name] = true
+				ms.Bad = true
+				st.Machines[name] = ms
+				emit(Action{
+					Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name,
+					Reason: "Drain 已注销、删机未生效：重试删除（非掉线，不记事件）",
+				})
+			} else {
+				// 注册还在（Drain 注销失败/机器转忙后又空闲）：清 Remedy 正常重判
+				ms.Remedy, ms.RemedyAt = "", time.Time{}
+				st.Machines[name] = ms
+			}
 		}
 	}
 }

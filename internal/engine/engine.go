@@ -136,7 +136,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	e.mu.Lock()
 	e.States[repo.Repo] = st
 	e.mu.Unlock()
-	stats := e.stats(repo, obs)
+	stats := e.stats(repo, obs, params)
 	if dryRun {
 		for _, a := range acts {
 			e.Log.Printf("[%s] dry-run %s: %s", repo.Repo, a.Kind, a.Reason)
@@ -147,8 +147,9 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	return acts, stats, nil
 }
 
-// stats 从观察与状态算 Q/QAge/I/P/N（§3.6.2 口径）。
-func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs) RoundStats {
+// stats 从观察与状态算 Q/QAge/I/P/N（§3.6.2 口径；冷启窗口与 decide 同源，
+// 此前写死 8 分钟会随参数覆盖漂移）。
+func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs, params decide.Params) RoundStats {
 	p := e.Cfg.ProfileOf(repo)
 	st := RoundStats{N: len(obs.Droplets), Complete: obs.Complete}
 	re := regexp.MustCompile(repo.NamespacePattern(p))
@@ -174,7 +175,7 @@ func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs) RoundStats {
 	}
 	for name := range dropletNames {
 		ms := state.Machines[name]
-		if ms.FirstOnlineAt.IsZero() && !ms.Bad && obs.Now.Sub(findDroplet(obs, name).CreatedAt) <= 8*time.Minute {
+		if ms.FirstOnlineAt.IsZero() && !ms.Bad && obs.Now.Sub(findDroplet(obs, name).CreatedAt) <= params.ColdStartTimeout {
 			st.P += p.RunnersPerDroplet
 		}
 	}
@@ -214,7 +215,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 			// 全局配额+预算占坑（复审修正 8：Reserve→建机→Commit/Abort，
 			// 判定与建机之间的间隙不会让两仓抢掉同一个名额）
 			if e.Gate != nil {
-				ok, reason := e.Gate.Reserve(ctx, liveDropletPrice(obs))
+				res, ok, reason := e.Gate.Reserve(ctx, liveDropletPrice(obs))
 				if !ok {
 					qAge := queueAge(obs)
 					e.Log.Printf("[%s] 跳过建机（场景 F）：%s", repo.Repo, reason)
@@ -224,8 +225,9 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 					}
 					continue
 				}
-				if err := e.create(ctx, repo, obs); err != nil {
-					e.Gate.Abort()
+				created, err := e.create(ctx, repo, obs)
+				if err != nil {
+					e.Gate.Abort(res)
 					e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
 					e.mu.Lock()
 					st := e.States[repo.Repo]
@@ -238,10 +240,10 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 					e.mu.Unlock()
 					continue
 				}
-				e.Gate.Commit()
+				e.Gate.Commit(res, created) // 占坑保留到列表可见/TTL
 				continue
 			}
-			if err := e.create(ctx, repo, obs); err != nil {
+			if _, err := e.create(ctx, repo, obs); err != nil {
 				e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
 				e.mu.Lock()
 				st := e.States[repo.Repo]
@@ -328,18 +330,18 @@ func (e *Engine) fireIncident(ctx context.Context, repo config.RepoEntry, a deci
 }
 
 // create：铸 token → 渲染 cloud-init → 写临时文件（0600；成功即删，失败留存
-// 供诊断）→ vpsctl create（不带 -wait）。
-func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs) error {
+// 供诊断）→ vpsctl create（不带 -wait）。返回 droplet 名（Gate 占坑沉淀用）。
+func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs) (string, error) {
 	p := e.Cfg.ProfileOf(repo)
 	name := decide.NextName(repo.NamePrefix(), p.Account, p.Region, convertDroplets(obs.Droplets))
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	if e.Renderer == nil {
-		return fmt.Errorf("cloud-init 渲染器未接入（cirunner pkg/cloudinit，阶段 3）——本阶段只允许 dry-run")
+		return "", fmt.Errorf("cloud-init 渲染器未接入（cirunner pkg/cloudinit，阶段 3）——本阶段只允许 dry-run")
 	}
 	token, err := e.GH.MintToken(ctxTO, repo.Repo)
 	if err != nil {
-		return fmt.Errorf("铸 registration token: %w", err)
+		return "", fmt.Errorf("铸 registration token: %w", err)
 	}
 	ci, err := e.Renderer.Render(RenderParams{
 		RepoURL:     "https://github.com/" + repo.Repo,
@@ -350,16 +352,16 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 		PublicKeys:  e.publicKeys(),
 	})
 	if err != nil {
-		return fmt.Errorf("渲染 cloud-init: %w", err)
+		return "", fmt.Errorf("渲染 cloud-init: %w", err)
 	}
 	dir := filepath.Join(e.stateDirOrDefault(), "cloudinit")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return "", err
 	}
 	// 文件含 1h 时效 token：建机成功即删；失败留存供排查（目录 0700）
 	path := filepath.Join(dir, name+".yaml")
 	if err := os.WriteFile(path, ci, 0o600); err != nil {
-		return err
+		return "", err
 	}
 	d, err := e.VPS.Create(ctxTO, vpsctlapi.CreateOpts{
 		Account: p.Account, Region: p.Region, Size: p.Size, Image: p.Image,
@@ -369,11 +371,11 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 		UserDataFile: path,
 	})
 	if err != nil {
-		return err // user-data 留存
+		return "", err // user-data 留存
 	}
 	_ = os.Remove(path)
 	e.Log.Printf("[%s] 已建机 %s (id=%s, ip=%q)", repo.Repo, d.Name, d.ID, d.IPv4Public)
-	return nil
+	return d.Name, nil
 }
 
 func (e *Engine) publicKeys() []string {
