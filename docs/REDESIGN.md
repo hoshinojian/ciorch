@@ -109,7 +109,8 @@
 4. **按机器记状态**，不按仓。
 5. **先建后拆**：替换故障机时，有配额就先建新机，再处理旧机，不让队列空窗。
 6. **先注销后删机**：缩容时先删 GitHub 注册，成功后才删 droplet（防 #7 竞态，见 §11 待实测 V1）。
-7. **观察不完整就不删**：任何一路观察失败，本轮对该仓只允许"建"不允许"删"（硬寿命上限除外）。
+7. **观察不完整整轮冻结**：任何一路观察失败（jobs / runners / droplets 分路记录成败），本轮不建、不删、不 ssh、不推进任何采样计数（OfflineSamples/StallSamples/IdleSince/BusySince）、不清理 Machines 记忆——只累计场景 H；droplets 一路成功时仍执行硬寿命回收（防成本泄漏）。
+   （2026-11-20 复审修订：原口径"只建不删"在 droplets 一路缺失时会把 N 当 0 而超建、把机器记忆清空，故收紧为冻结。）
 8. **动作互相隔离**：一个动作失败只记日志 + 计入退避，不影响同轮其他动作。
 9. **大模型只出主意不动手**：拿不到任何凭据和 shell，只返回结构化结论；编排器校验后在硬上限内执行白名单动作。
 10. **钱有硬上限**：全局并发机器数、每仓上限、每日预算，由确定性代码执行，大模型无法突破。
@@ -290,7 +291,7 @@ docs/                  本设计的副本 + runbook
 4. **label 匹配**：job 的 labels（小写化）⊆ `{self-hosted, linux, x64} ∪ profile.labels`（小写化）→ `Matchable=true`。不可匹配的 queued job 记入 `UnmatchedQueued`（场景 E）。
 5. 列 runner（含 labels、status、busy）。
 6. `vpsctl list -tag <仓 tag> -only <account>` 列本仓 droplet（含 created_at、ipv4_private、price_monthly）。
-7. 任一步失败：`Obs.Complete=false`，并记录哪一路失败。
+7. 任一步失败：`Obs.Complete=false`，分路记录 `JobsOK/RunnersOK/DropletsOK`，其余路照采。decide 对不完整观察**整轮冻结**（见 §2.2 原则 7 修订）——原"只建不删"在 droplets 缺失时会超建，已收紧。
 
 ```go
 type Obs struct {
