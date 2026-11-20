@@ -177,3 +177,26 @@ func hasRemoveReg(acts []Action, name string) bool {
 	}
 	return false
 }
+
+// 顺手修：LastActivity 按不同 RunID 记——同一 run 的多个 job 只算一次活动。
+func TestLastActivityByRunID(t *testing.T) {
+	o := obs()
+	// 一个 run 的 7 个 job 都在跑（同 RunID=100）
+	for i := 0; i < 7; i++ {
+		o.Jobs = append(o.Jobs, observe.Job{
+			ID: int64(i), RunID: 100, Status: "in_progress",
+			CreatedAt: t0.Add(-10 * time.Minute), StartedAt: t0.Add(-10 * time.Minute),
+		})
+	}
+	st := RepoState{}
+	_, st2 := Decide(params(), st, o)
+	if len(st2.LastActivity) != 1 {
+		t.Fatalf("同 run 多 job 只记一次活动点，got %d 个：%v", len(st2.LastActivity), st2.LastActivity)
+	}
+	// 两个不同 run → 两个活动点
+	o.Jobs = append(o.Jobs, observe.Job{ID: 99, RunID: 200, Status: "in_progress", CreatedAt: t0.Add(-5 * time.Minute), StartedAt: t0.Add(-5 * time.Minute)})
+	_, st3 := Decide(params(), st, o)
+	if len(st3.LastActivity) != 2 {
+		t.Fatalf("两个 run 应两个活动点，got %d", len(st3.LastActivity))
+	}
+}

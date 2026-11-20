@@ -105,11 +105,19 @@ type Observer interface {
 // SetCollector 注入观察器。
 func (e *Engine) SetCollector(c Observer) { e.Collector = c }
 
+// RoundStats 是一轮的量化摘要（§3.9 摘要行与 daemon 轮询切换的数据源）。
+type RoundStats struct {
+	Q, N     int
+	QAge     time.Duration
+	I, P     int
+	Complete bool
+}
+
 // Reconcile 对一个仓走一轮：observe → decide → 执行。
 // dryRun = 只观察决策写日志不执行。建机配额/预算经 Gate 互斥判定（复审修正 8）。
-func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bool) ([]decide.Action, error) {
+func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bool) ([]decide.Action, RoundStats, error) {
 	if e.Collector == nil {
-		return nil, fmt.Errorf("collector 未注入")
+		return nil, RoundStats{}, fmt.Errorf("collector 未注入")
 	}
 	p := e.Cfg.ProfileOf(repo)
 	obs, err := e.Collector.Collect(ctx, repo, p)
@@ -128,14 +136,58 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	e.mu.Lock()
 	e.States[repo.Repo] = st
 	e.mu.Unlock()
+	stats := e.stats(repo, obs)
 	if dryRun {
 		for _, a := range acts {
 			e.Log.Printf("[%s] dry-run %s: %s", repo.Repo, a.Kind, a.Reason)
 		}
-		return acts, nil
+		return acts, stats, nil
 	}
 	e.execute(ctx, repo, obs, acts)
-	return acts, nil
+	return acts, stats, nil
+}
+
+// stats 从观察与状态算 Q/QAge/I/P/N（§3.6.2 口径）。
+func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs) RoundStats {
+	p := e.Cfg.ProfileOf(repo)
+	st := RoundStats{N: len(obs.Droplets), Complete: obs.Complete}
+	re := regexp.MustCompile(repo.NamespacePattern(p))
+	for _, j := range obs.Jobs {
+		if j.Status == "queued" {
+			st.Q++
+			if a := obs.Now.Sub(j.CreatedAt); a > st.QAge {
+				st.QAge = a
+			}
+		}
+	}
+	dropletNames := map[string]bool{}
+	for _, d := range obs.Droplets {
+		dropletNames[d.Name] = true
+	}
+	e.mu.Lock()
+	state := e.States[repo.Repo]
+	e.mu.Unlock()
+	for _, r := range obs.Runners {
+		if r.Status == "online" && !r.Busy && re.MatchString(r.Name) {
+			st.I++
+		}
+	}
+	for name := range dropletNames {
+		ms := state.Machines[name]
+		if ms.FirstOnlineAt.IsZero() && !ms.Bad && obs.Now.Sub(findDroplet(obs, name).CreatedAt) <= 8*time.Minute {
+			st.P += p.RunnersPerDroplet
+		}
+	}
+	return st
+}
+
+func findDroplet(obs observe.Obs, name string) observe.Droplet {
+	for _, d := range obs.Droplets {
+		if d.Name == name {
+			return d
+		}
+	}
+	return observe.Droplet{}
 }
 
 // StatesSnapshot 返回决策记忆的深拷贝（持久化/查询用，锁内拷贝——复审修正 7）。
@@ -202,11 +254,17 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 				e.mu.Unlock()
 			}
 		case decide.ActDrain:
-			// 先注销注册，成功后才删机（防 #7 竞态；注销失败本轮放弃删机）
-			if err := e.GH.RemoveRunner(ctx, repo.Repo, a.RunnerID); err != nil {
-				e.Log.Printf("[%s] Drain 注销失败，保留机器下轮重判: %v", repo.Repo, err)
-				continue
+			// 先注销注册，成功后才删机（防 #7 竞态；注销失败本轮放弃删机——
+			// V1 未实测前保守）。RunnerID==0（注册已不在，机器命名空间内查无
+			// 注册）则跳过注销直接删机，否则会永远注销失败卡死删机。
+			if a.RunnerID != 0 {
+				if err := e.GH.RemoveRunner(ctx, repo.Repo, a.RunnerID); err != nil {
+					e.Log.Printf("[%s] Drain 注销失败，保留机器下轮重判: %v", repo.Repo, err)
+					continue
+				}
 			}
+			// rpd=2：顺带清 -a/-b 实例的注册（按名清理，尽力而为）
+			e.removeRunnerByName(ctx, repo, a.DropletName)
 			if err := e.VPS.Delete(ctx, e.Cfg.ProfileOf(repo).Account, a.DropletID); err != nil {
 				e.Log.Printf("[%s] Drain 删机失败: %v", repo.Repo, err)
 				continue

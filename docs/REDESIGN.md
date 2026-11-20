@@ -287,7 +287,7 @@ docs/                  本设计的副本 + runbook
 
 1. 列近 24h 未完成 run → 对每个 run 拉 jobs（filter=latest）。
 2. 合并 webhook job 缓存（同 job id 以 `updated` 更新者为准；缓存条目 2 小时过期）。
-3. 只保留 job `status ∈ {queued, in_progress}`；`waiting`（环境审批）、`requested`、`pending` 不算需求但记录计数（status 输出用）。
+3. 只保留 job `status ∈ {queued, in_progress}`；`waiting`（环境审批）、`requested`、`pending` 不算需求但记录计数（status 输出用；2026-11-20 确认落点为 `Obs.PendingJobs` 字段）。
 4. **label 匹配**：job 的 labels（小写化）⊆ `{self-hosted, linux, x64} ∪ profile.labels`（小写化）→ `Matchable=true`。不可匹配的 queued job 记入 `UnmatchedQueued`（场景 E）。
 5. 列 runner（含 labels、status、busy）。
 6. `vpsctl list -tag <仓 tag> -only <account>` 列本仓 droplet（含 created_at、ipv4_private、price_monthly）。
@@ -367,7 +367,11 @@ type Breaker struct {
     State     string    // closed | open | half-open
     Fails     int       // 连续冷启失败
     OpenedAt  time.Time
+    Cooldown  time.Duration // 当前冷却时长；回 open 时翻倍封顶 4h（0=默认 30m）
 }
+// 2026-11-20 复审补充（§3.6.5 升级判据所需，结构体未列的必要记忆）：
+// RepoState 增加 StallEvents/OfflineEvents []time.Time（A/C 的"24h 内第 2 次"
+// 升级判据）与 ObserveFailStreak int（H 的连续失败轮数）。
 ```
 
 冷启计时以 droplet `CreatedAt` 为准（守护重启不丢）。droplet 消失 → 删除其 MachineState。
@@ -442,6 +446,7 @@ type Breaker struct {
 
 - 全局并发：所有仓 droplet 总数 ≤ `max_droplets`。统计方式：`vpsctl list -tag ciorch -only <每个用到的 account>`，按 droplet id 去重（同 token 多账号会重复，原型已踩过）。
 - 每日预算：`hourly = price_monthly / 672`（DO 月封顶 672 小时口径）；当日花费 = Σ 每台 droplet 当日存活小时 × hourly（按 UTC 自然日，状态里累计已删机器的部分）。预计建一台后超过 `daily_budget_usd` → 不建，触发场景 F。
+  （2026-11-20 口径确认："预计建一台"按**新机 1 小时**计——满 24h 投影会让本节示例的 $5 日预算永远建不了 c2 机型，与示例矛盾；真实花费由 SpentToday/RecordDeletion 入账兜底。）
 - 多仓争抢：同一轮各仓先各自 Decide 出 `Create` 请求，再由 budget 统一分配，**按 QAge 从老到新**排序发放。
 - 腾配额：某仓场景 F 时，若其他仓有 online、busy=false、Q==0 的机器 → 对其 `Drain`（不受该仓 idle_timeout 限制），下一轮再分配。
 - 编排器自身机器不计入。

@@ -84,18 +84,31 @@ func TestTriggerNonBlocking(t *testing.T) {
 	}
 }
 
-// summary：无动作时输出 active 标记；有动作时列动作名。
-func TestSummary(t *testing.T) {
+// kindsOf：动作名列表（空 → 无）。
+func TestKindsOf(t *testing.T) {
+	if got := kindsOf(nil); got != "无" {
+		t.Fatalf("空动作应显示 无，got %q", got)
+	}
+	if got := kindsOf([]decide.Action{{Kind: decide.ActDrain}, {Kind: decide.ActCreate}}); got != "drain,create" {
+		t.Fatalf("动作摘要不对: %q", got)
+	}
+}
+
+// active() 考虑 Q>0（复审修正：此前只看机器状态）。
+func TestActiveWithQueue(t *testing.T) {
 	d := testDaemon(t)
 	repo := d.Cfg.Repos[0]
-	d.Engine.States[repo.Repo] = decide.RepoState{Machines: map[string]decide.MachineState{
-		"m1": {FirstSeen: time.Now()},
-	}}
-	if s := d.summary(repo, nil); s != "actions=[] active=true" {
-		t.Fatalf("summary 不对: %q", s)
+	d.mu.Lock()
+	d.lastStats[repo.Repo] = engine.RoundStats{Q: 1}
+	d.mu.Unlock()
+	if !d.active(repo) {
+		t.Fatal("有排队应活跃档")
 	}
-	if s := d.summary(repo, []decide.Action{{Kind: decide.ActDrain}, {Kind: decide.ActCreate}}); s != "actions=[drain,create]" {
-		t.Fatalf("动作摘要不对: %q", s)
+	d.mu.Lock()
+	d.lastStats[repo.Repo] = engine.RoundStats{}
+	d.mu.Unlock()
+	if d.active(repo) {
+		t.Fatal("无排队无机器应空闲档")
 	}
 }
 
