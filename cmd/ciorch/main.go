@@ -153,11 +153,12 @@ func cmdPlan(configPath, token, repoFilter string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	for _, r := range reposOf(cfg, repoFilter) {
-		acts, err := e.Reconcile(ctx, r, true) // dry-run：只决策打印
+		acts, stats, err := e.Reconcile(ctx, r, true) // dry-run：只决策打印
 		if err != nil {
 			return err
 		}
-		fmt.Printf("== %s 本轮动作 ==\n", r.Repo)
+		fmt.Printf("== %s Q=%d QAge=%v I=%d P=%d N=%d complete=%v，本轮动作 ==\n",
+			r.Repo, stats.Q, stats.QAge, stats.I, stats.P, stats.N, stats.Complete)
 		if len(acts) == 0 {
 			fmt.Println("  （无）")
 		}

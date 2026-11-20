@@ -394,10 +394,18 @@ func supply(p Params, st RepoState, views map[string]*machineView, now time.Time
 }
 
 func recordActivity(st *RepoState, obs observe.Obs) {
+	// 按不同 RunID 各记一个时间点（复审修正：按 job 记会让一个 run 的 7 个
+	// job 跑一次就满足"近 2h 活跃≥2 次"，空闲阈值几乎永远 45 分钟档）
+	byRun := map[int64]time.Time{}
 	for _, j := range obs.Jobs {
 		if j.Status == "in_progress" && !j.StartedAt.IsZero() {
-			st.LastActivity = append(st.LastActivity, j.StartedAt)
+			if t, ok := byRun[j.RunID]; !ok || j.StartedAt.After(t) {
+				byRun[j.RunID] = j.StartedAt
+			}
 		}
+	}
+	for _, t := range byRun {
+		st.LastActivity = append(st.LastActivity, t)
 	}
 	sort.Slice(st.LastActivity, func(i, j int) bool { return st.LastActivity[i].Before(st.LastActivity[j]) })
 	out := st.LastActivity[:0]

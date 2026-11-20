@@ -38,8 +38,9 @@ type Daemon struct {
 	// DryRun = shadow 模式：只观察与决策，不执行任何动作（§3.8）。
 	DryRun bool
 
-	mu       sync.Mutex
-	triggers map[string]chan struct{}
+	mu        sync.Mutex
+	triggers  map[string]chan struct{}
+	lastStats map[string]engine.RoundStats // 仓 → 最近一轮 Q 等（active 判定与摘要）
 }
 
 // New 构造。
@@ -50,8 +51,9 @@ func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, l budget.Lister
 	return &Daemon{
 		Cfg: cfg, Engine: e, Budget: b, Lister: l, Log: lg,
 		PollActive: defaultPollActive, PollIdle: defaultPollIdle,
-		Now:      time.Now,
-		triggers: map[string]chan struct{}{},
+		Now:       time.Now,
+		triggers:  map[string]chan struct{}{},
+		lastStats: map[string]engine.RoundStats{},
 	}
 }
 
@@ -124,14 +126,17 @@ func (d *Daemon) loopRepo(ctx context.Context, repo config.RepoEntry, trigger ch
 func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath string) time.Duration {
 	now := d.Now()
 
-	acts, err := d.Engine.Reconcile(ctx, repo, d.DryRun)
+	acts, stats, err := d.Engine.Reconcile(ctx, repo, d.DryRun)
 	if err != nil {
 		d.Log.Printf("[%s] reconcile 失败: %v", repo.Repo, err)
 	}
+	d.mu.Lock()
+	d.lastStats[repo.Repo] = stats
+	d.mu.Unlock()
 
-	// 摘要一行（§3.9）
-	summary := d.summary(repo, acts)
-	d.Log.Printf("[%s] %s", repo.Repo, summary)
+	// 摘要一行（§3.9：repo=… Q=… QAge=… I=… P=… N=… actions=[…] complete=…）
+	d.Log.Printf("[%s] Q=%d QAge=%v I=%d P=%d N=%d actions=[%s] complete=%v",
+		repo.Repo, stats.Q, stats.QAge, stats.I, stats.P, stats.N, kindsOf(acts), stats.Complete)
 
 	// 原子写状态（锁内深拷贝快照——复审修正 7）
 	if err := state.Save(statePath, map[string]any{"repos": d.Engine.StatesSnapshot()}); err != nil {
@@ -144,6 +149,12 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 // 或有未结事故。观察数据拿不到"未结事故"（阶段 5），此处按前三者 + 状态里
 // 有机器处于 remedy。
 func (d *Daemon) active(repo config.RepoEntry) bool {
+	d.mu.Lock()
+	stats := d.lastStats[repo.Repo]
+	d.mu.Unlock()
+	if stats.Q > 0 { // 有排队：活跃档（复审修正：此前只看机器状态）
+		return true
+	}
 	st := d.Engine.StatesSnapshot()[repo.Repo]
 	for _, m := range st.Machines {
 		if m.Remedy != "" {
@@ -167,15 +178,8 @@ func (d *Daemon) nextInterval(repo config.RepoEntry, now time.Time) time.Duratio
 	return dur
 }
 
-// summary 生成轮摘要（repo=… Q=… 之类的行内数据从 engine 动作反推不够，
-// 摘要的 Q/I/P/N 由观察侧另存——阶段 2 简化为动作列表 + 活跃态）。
-func (d *Daemon) summary(repo config.RepoEntry, acts []decide.Action) string {
-	if len(acts) == 0 {
-		if d.active(repo) {
-			return "actions=[] active=true"
-		}
-		return "actions=[] active=false"
-	}
+// kindsOf 动作名列表（摘要行用）。
+func kindsOf(acts []decide.Action) string {
 	kinds := ""
 	for _, a := range acts {
 		if kinds != "" {
@@ -183,5 +187,8 @@ func (d *Daemon) summary(repo config.RepoEntry, acts []decide.Action) string {
 		}
 		kinds += string(a.Kind)
 	}
-	return "actions=[" + kinds + "]"
+	if kinds == "" {
+		kinds = "无"
+	}
+	return kinds
 }

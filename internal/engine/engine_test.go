@@ -151,7 +151,7 @@ func TestExecuteOrderDeleteBeforeCreate(t *testing.T) {
 	st := preloadState(gh, name)
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = st
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.order) < 2 || !strings.HasPrefix(vps.order[0], "delete:") || vps.order[1] != "create" {
@@ -169,7 +169,7 @@ func TestDrainRegistrationFailureKeepsMachine(t *testing.T) {
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.deleted) != 0 {
@@ -190,7 +190,7 @@ func TestActionIsolation(t *testing.T) {
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps.created) != 1 {
@@ -209,7 +209,7 @@ func TestCreateUserDataLifecycle(t *testing.T) {
 	vps := &fakeVPS{createErr: fmt.Errorf("DO 503")}
 	e := New(cfg, gh, vps, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(&fakeObs{o})
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	files, _ := filepath.Glob(filepath.Join(cfg.StateDir, "cloudinit", "*.yaml"))
@@ -225,7 +225,7 @@ func TestCreateUserDataLifecycle(t *testing.T) {
 	vps2 := &fakeVPS{}
 	e2 := New(testCfg(t), &fakeGH{}, vps2, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e2.SetCollector(&fakeObs{o})
-	if _, err := e2.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e2.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(vps2.created) != 1 {
@@ -248,7 +248,7 @@ func TestDryRunExecutesNothing(t *testing.T) {
 	gh := &fakeGH{}
 	vps := &fakeVPS{}
 	e := newEngine(t, gh, vps, &fakeObs{o})
-	acts, err := e.Reconcile(context.Background(), nmsRepo(), true)
+	acts, _, err := e.Reconcile(context.Background(), nmsRepo(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestConcurrentReposNoRace(t *testing.T) {
 		go func(repo config.RepoEntry) {
 			defer wg.Done()
 			for i := 0; i < 20; i++ {
-				if _, err := e.Reconcile(context.Background(), repo, true); err != nil {
+				if _, _, err := e.Reconcile(context.Background(), repo, true); err != nil {
 					t.Errorf("reconcile: %v", err)
 					return
 				}
@@ -339,7 +339,7 @@ func TestGateSingleSlotTwoRepos(t *testing.T) {
 		wg.Add(1)
 		go func(repo config.RepoEntry) {
 			defer wg.Done()
-			if _, err := e.Reconcile(context.Background(), repo, false); err != nil {
+			if _, _, err := e.Reconcile(context.Background(), repo, false); err != nil {
 				t.Errorf("reconcile: %v", err)
 			}
 		}(r)
@@ -366,7 +366,7 @@ func TestGateBudgetDenialIncidentF(t *testing.T) {
 	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-16 * time.Minute)}}
 	e.SetCollector(&fakeObs{o})
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(incidents) == 0 || incidents[0].IncidentType != "F" {
@@ -389,7 +389,7 @@ func TestDrainRecordsDeletionToBudget(t *testing.T) {
 	e.Gate = gate
 	e.SetCollector(&fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(nil, name)
-	if _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
 	if len(cl.deleted) != 1 {
@@ -436,4 +436,44 @@ func (c *cluster) Delete(ctx context.Context, account, id string) error {
 	}
 	c.droplets = out
 	return nil
+}
+
+// 顺手修：Drain 遇 RunnerID==0（注册已不在）→ 跳过注销直接删机（否则永远
+// 注销失败，机器删不掉）。
+func TestDrainWithoutRegistrationDeletesDirectly(t *testing.T) {
+	name := "ci-nms-team2-ci-sgp1-01"
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour)}}
+	// 无任何注册（Runners 空 → decide 的 Drain 带 RunnerID=0）
+	cl := &cluster{}
+	e := New(testCfg(t), &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.SetCollector(&fakeObs{o})
+	e.States[nmsRepo().Repo] = preloadState(nil, name)
+	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(cl.deleted) != 1 {
+		t.Fatalf("无注册时应直接删机：%v", cl.deleted)
+	}
+}
+
+// 顺手修：Reconcile 带回 Q/QAge/I/P/N（§3.9 摘要行数据源）。
+func TestReconcileReturnsStats(t *testing.T) {
+	name := "ci-nms-team2-ci-sgp1-01"
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o.Jobs = []observe.Job{
+		{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-3 * time.Minute)},
+		{ID: 2, RunID: 1, Status: "in_progress", CreatedAt: tnow.Add(-2 * time.Minute), StartedAt: tnow.Add(-2 * time.Minute)},
+	}
+	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-10 * time.Minute)}}
+	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
+	e := newEngine(t, &fakeGH{}, &fakeVPS{}, &fakeObs{o})
+	e.States[nmsRepo().Repo] = preloadState(nil, name)
+	_, stats, err := e.Reconcile(context.Background(), nmsRepo(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Q != 1 || stats.QAge != 3*time.Minute || stats.I != 1 || stats.N != 1 {
+		t.Fatalf("stats 不对: %+v", stats)
+	}
 }
