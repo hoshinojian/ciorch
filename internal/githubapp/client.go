@@ -60,9 +60,10 @@ type Run struct {
 	RunStartedAt time.Time `json:"run_started_at"`
 }
 
-// Job 是 jobs 接口条目（阶段 1 字段：排队等待与冷启代理所需）。
+// Job 是 jobs 接口条目（阶段 1-2 字段：排队等待/冷启代理/label 匹配所需）。
 type Job struct {
 	ID          int64     `json:"id"`
+	RunID       int64     `json:"run_id"`
 	Name        string    `json:"name"`
 	Status      string    `json:"status"`
 	Conclusion  string    `json:"conclusion"`
@@ -71,6 +72,16 @@ type Job struct {
 	CompletedAt time.Time `json:"completed_at"`
 	RunnerID    int64     `json:"runner_id"`
 	RunnerName  string    `json:"runner_name"`
+	Labels      []string  `json:"labels"`
+}
+
+// Runner 是 runners 接口条目（本仓全部注册，含外部——归属过滤由 observe/decide 做）。
+type Runner struct {
+	ID     int64    `json:"id"`
+	Name   string   `json:"name"`
+	Status string   `json:"status"` // online | offline
+	Busy   bool     `json:"busy"`
+	Labels []string `json:"labels"`
 }
 
 // ListRuns 返回 since 之后创建的全部 run（按 created>= 服务端过滤 + 客户端兜底）。
@@ -116,6 +127,27 @@ func (c *Client) ListJobs(ctx context.Context, repo string, runID int64) ([]Job,
 			return fmt.Errorf("解析 jobs: %w", err)
 		}
 		out = append(out, page.Jobs...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListRunners 返回仓内全部 runner 注册（含 labels，§3.4.4）。
+func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error) {
+	var out []Runner
+	q := url.Values{}
+	q.Set("per_page", "100")
+	err := c.paginate(ctx, fmt.Sprintf("repos/%s/actions/runners", repo), q, func(body json.RawMessage) error {
+		var page struct {
+			Runners []Runner `json:"runners"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return fmt.Errorf("解析 runners: %w", err)
+		}
+		out = append(out, page.Runners...)
 		return nil
 	})
 	if err != nil {
