@@ -255,15 +255,18 @@ func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 	syncMachines(&st, obs)
 	machines := buildViews(p, &st, obs)
 
-	// 场景判定（先判定后汇总；同机一轮一个补救，优先级 C>B>A>D，§3.6.5）
+	// 场景判定（先判定后汇总；同机一轮一个补救，优先级 C>B>A>D，§3.6.5）。
+	// 先处理已判死机器（幂等重删）与 Drain 残留（复审修正 4/6）。
 	remedied := map[string]bool{}
-	scenarioC(p, &st, obs, machines, emit, remedied)
-	scenarioB(p, &st, obs, machines, emit, remedied)
+	handleBadMachines(&st, obs, machines, emit, remedied)
+	scenarioC(p, &st, obs, machines, Q, emit, remedied)
+	scenarioB(p, &st, obs, machines, Q, emit, remedied)
 	scenarioA(p, &st, obs, machines, Q, QAge, emit, remedied)
 	scenarioD(p, &st, obs, machines, emit, remedied)
 	scenarioG(p, obs, Q, QAge, emit)
 	scenarioE(p, obs, emit)
 	scenarioH(p, &st, obs, emit)
+	scenarioRemoveReg(p, obs, machines, emit)
 
 	// 扩缩容（§3.6.3；场景替换机计入在途供给，防双重建机）
 	inFlight := 0

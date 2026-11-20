@@ -3,6 +3,7 @@
 package decide
 
 import (
+	"strings"
 	"time"
 
 	"github.com/hoshinojian/ciorch/internal/observe"
@@ -42,9 +43,38 @@ func hardLifetime(p Params, st *RepoState, obs observe.Obs, views map[string]*ma
 	}
 }
 
+// handleBadMachines 已判死机器的幂等处置（复审修正 4）：Bad 机器每轮只重发
+// 删除动作（DO 删除有延迟/失败重试），不再建替换机、不再计熔断、不再记事件。
+// 同时（复审修正 6）：Remedy=="draining" 且未 Bad 的机器（Drain 注销失败/
+// job 刚派到转忙后又空闲）清掉 Remedy 正常重判——Drain 只是一次尝试。
+func handleBadMachines(st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
+	for name, m := range views {
+		ms := st.Machines[name]
+		if ms.Bad {
+			remedied[name] = true
+			kind := ActForceDelete
+			reason := "已判死机器：重试删除（droplet 仍在列表，DO 删除延迟/上次失败）"
+			if ms.Remedy == "draining" {
+				kind = ActDrain
+				reason = "已判死机器：重试回收（先注销后删，droplet 仍在列表）"
+			}
+			emit(Action{
+				Kind: kind, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+				Reason: reason,
+			})
+			continue
+		}
+		if ms.Remedy == "draining" {
+			// Drain 尝试失败后机器还在：清 Remedy，本轮重新判定（空闲/硬寿命可再发）
+			ms.Remedy, ms.RemedyAt = "", time.Time{}
+			st.Machines[name] = ms
+		}
+	}
+}
+
 // scenarioC 掉线：曾 online、当前 offline（或注册消失）连续 OfflineSamples 轮
 // → 先建后拆（同 B），不计熔断；同仓 24h 内第 2 次 → 事故。
-func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
+func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, Q int, emit func(Action), remedied map[string]bool) {
 	for name, m := range views {
 		if remedied[name] {
 			continue
@@ -59,10 +89,11 @@ func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		remedied[name] = true
 		st.OfflineEvents = append(st.OfflineEvents, obs.Now)
 		st.OfflineEvents = pruneEvents(st.OfflineEvents, obs.Now, stallHistoryWindow)
-		// 先建后拆：有配额先建替换机，再强删旧机（掉线机注册大概率已消失；
-		// engine 会把同名残留注册一并清理）
-		if N := len(views); N < p.MaxRunners {
-			emit(Action{Kind: ActCreate, Reason: "场景 C 掉线：先建替换机（不让队列空窗）"})
+		// 先建后拆：有配额且有需求才建替换机，再强删旧机（复审修正 10：
+		// Q=0 时建了也会被空闲回收，白花钱）；掉线机注册大概率已消失，
+		// engine 会把同名残留注册一并清理
+		if Q > 0 && len(views) < p.MaxRunners {
+			emit(Action{Kind: ActCreate, Reason: "场景 C 掉线：有排队需求，先建替换机（不让队列空窗）"})
 		}
 		ms.Bad = true
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
@@ -81,7 +112,7 @@ func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 // scenarioB 冷启失败：droplet 年龄 ≥ ColdStartTimeout 且 runner 从未 online
 // → 替换 + 删旧 + Breaker.Fails++；Fails 达上限 → open + 事故；
 // open 满 cooldown → half-open（允许 1 台试探）；试探失败 → open 且冷却翻倍。
-func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
+func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, Q int, emit func(Action), remedied map[string]bool) {
 	for name, m := range views {
 		if remedied[name] {
 			continue
@@ -96,8 +127,9 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		}
 		remedied[name] = true
 		wasHalfOpen := st.Breaker.State == "half-open"
-		if len(views) < p.MaxRunners {
-			emit(Action{Kind: ActCreate, Reason: "场景 B 冷启失败：先建替换机（不让队列空窗）"})
+		// 复审修正 10：替换机只在有排队需求时建（Q=0 建了也被空闲回收）
+		if Q > 0 && len(views) < p.MaxRunners {
+			emit(Action{Kind: ActCreate, Reason: "场景 B 冷启失败：有排队需求，先建替换机（不让队列空窗）"})
 		}
 		ms.Bad = true
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
@@ -176,8 +208,8 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		remedied[name] = true
 		st.StallEvents = append(st.StallEvents, obs.Now)
 		st.StallEvents = pruneEvents(st.StallEvents, obs.Now, stallHistoryWindow)
-		if len(views) < p.MaxRunners {
-			emit(Action{Kind: ActCreate, Reason: "场景 A 假活：先建替换机（不让队列空窗）"})
+		if Q > 0 && len(views) < p.MaxRunners {
+			emit(Action{Kind: ActCreate, Reason: "场景 A 假活：有排队需求，先建替换机（不让队列空窗）"})
 		}
 		ms.Remedy, ms.RemedyAt = "restarting", obs.Now
 		st.Machines[name] = ms
@@ -196,20 +228,38 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 	}
 }
 
-// scenarioD job 卡死：runner busy 持续 ≥ JobStuckAlert → 事故；
-// ≥ JobStuckKill → 再 ForceDelete（强删：job 已判死；告警不因击杀而省略）。
+// scenarioD job 卡死（复审修正 3）：按 Obs.Jobs 里本机 runner 名对得上、
+// status=in_progress 的 job 的 StartedAt 判卡死——机器级"持续 busy"会把连续
+// 接单的健康机器误杀（复现 R3：连续 7×15m job 到 1h 报事故/90m 被强删）。
+// 拿不到 job 信息（如 jobs 一路缺该 job）不判 D——不退回机器级 BusySince。
 func scenarioD(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
 	for name, m := range views {
 		ms := st.Machines[name]
-		if ms.BusySince.IsZero() {
+		if ms.Bad {
 			continue
 		}
-		busy := obs.Now.Sub(ms.BusySince)
+		var busy time.Duration
+		found := false
+		for _, r := range m.runners {
+			if r.Status != "online" || !r.Busy {
+				continue
+			}
+			for _, j := range obs.Jobs {
+				if j.Status == "in_progress" && j.RunnerName == r.Name && !j.StartedAt.IsZero() {
+					if d := obs.Now.Sub(j.StartedAt); !found || d > busy {
+						busy, found = d, true
+					}
+				}
+			}
+		}
+		if !found {
+			continue // 无 job 佐证：不判 D
+		}
 		if busy < p.JobStuckAlert {
 			continue
 		}
 		emit(Action{Kind: ActIncident, IncidentType: "D", IncidentKey: name,
-			Reason: "场景 D job 卡死：busy 持续超告警线"})
+			Reason: "场景 D job 卡死：本机 in_progress job 持续超告警线"})
 		if busy >= p.JobStuckKill {
 			remedied[name] = true
 			ms.Bad = true
@@ -217,9 +267,36 @@ func scenarioD(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			st.Machines[name] = ms
 			emit(Action{
 				Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
-				Reason: "场景 D job 卡死：busy 超过击杀线，强删机器（先删机再清注册，job 已判死）",
+				Reason: "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）",
 			})
 		}
+	}
+}
+
+// scenarioRemoveReg（复审修正 9）：本仓命名空间内、offline、且没有对应
+// droplet 的注册 → 清理残留（原型已有此逻辑，迁移时遗漏）。只在观察完整时
+// 产出——冻结轮一律不动。rpd=2 时按去掉 -a/-b 后缀对 droplet 名。
+func scenarioRemoveReg(p Params, obs observe.Obs, views map[string]*machineView, emit func(Action)) {
+	if p.OwnedRunnerRe == nil {
+		return
+	}
+	for _, r := range obs.Runners {
+		if r.Status != "offline" || !p.OwnedRunnerRe.MatchString(r.Name) {
+			continue
+		}
+		base := r.Name
+		if n, ok := strings.CutSuffix(base, "-a"); ok {
+			base = n
+		} else if n, ok := strings.CutSuffix(base, "-b"); ok {
+			base = n
+		}
+		if _, has := views[base]; has {
+			continue // 机器还在：归场景 C，不是残留
+		}
+		emit(Action{
+			Kind: ActRemoveReg, RunnerID: r.ID, RunnerName: r.Name,
+			Reason: "offline 残留注册：命名空间内但无对应 droplet",
+		})
 	}
 }
 
@@ -341,7 +418,11 @@ func scaling(p Params, st *RepoState, obs observe.Obs, views map[string]*machine
 			return
 		}
 	case "half-open":
-		// 只允许 1 台试探：want 封顶 1（P 已含在途，通常自然为 1）
+		// 只允许 1 台试探：已有冷启在途（P>0，含场景替换机）则不再建
+		// （复审修正 5：此前每轮各建 1 台，3 轮建出 3 台试探机）
+		if P > 0 {
+			return
+		}
 	}
 	rpd := p.RunnersPerDroplet
 	headroom := (p.MaxRunners - N) * rpd
