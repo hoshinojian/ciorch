@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +29,20 @@ type Client struct {
 	token     string
 	http      *http.Client
 	userAgent string
+
+	// §3.4.3：5xx/网络错误/超时同轮退避重试 2 次；ETag 条件请求；
+	// 限流感知。Sleep 与退避可注入（测试）。
+	sleep         func(ctx context.Context, d time.Duration) error
+	bo            []time.Duration // 重试退避序列（默认 0.5s、1.5s）
+	etags         map[string]etagEntry
+	rateMu        sync.Mutex
+	rateRemaining int // 最近一次响应的 X-RateLimit-Remaining（-1=未知）
+}
+
+type etagEntry struct {
+	etag string
+	body []byte
+	link string // 页间 Link rel="next"（304 复用缓存时仍可翻页）
 }
 
 // Option 定制客户端。
@@ -37,18 +53,160 @@ func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = strings.TrimSuffix(u, "/") }
 }
 
+// WithRetryBackoff 覆盖重试退避序列（测试注入零等待）。
+func WithRetryBackoff(ds ...time.Duration) Option {
+	return func(c *Client) { c.bo = ds }
+}
+
+// WithSleeper 覆盖等待实现（测试）。
+func WithSleeper(f func(ctx context.Context, d time.Duration) error) Option {
+	return func(c *Client) { c.sleep = f }
+}
+
 // NewClient 构造客户端（token 必填，来源解析在 internal/config.ResolveToken）。
 func NewClient(token string, opts ...Option) *Client {
 	c := &Client{
-		baseURL:   defaultBaseURL,
-		token:     token,
-		http:      &http.Client{Timeout: 15 * time.Second},
-		userAgent: "ciorch",
+		baseURL:       defaultBaseURL,
+		token:         token,
+		http:          &http.Client{Timeout: 15 * time.Second},
+		userAgent:     "ciorch",
+		bo:            []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond},
+		etags:         map[string]etagEntry{},
+		rateRemaining: -1,
+	}
+	c.sleep = func(ctx context.Context, d time.Duration) error {
+		select {
+		case <-time.After(d):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	for _, o := range opts {
 		o(c)
 	}
 	return c
+}
+
+// RateRemaining 返回最近一次响应的 X-RateLimit-Remaining（-1=未见）。
+// daemon 据此在 <10% 时把轮询间隔 ×4（§3.4.3）。
+func (c *Client) RateRemaining() int {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+	return c.rateRemaining
+}
+
+// fetch 是带重试/ETag/限流的 GET（§3.4.3）。返回 body 与 Link rel="next"
+// （304 时用缓存，含缓存的 link）。
+func (c *Client) fetch(ctx context.Context, path, fullURL string) ([]byte, string, error) {
+	if fullURL == "" {
+		fullURL = c.baseURL + "/" + path
+	}
+	backoff := append([]time.Duration(nil), c.bo...)
+	cached := c.etags[fullURL]
+
+	type result struct {
+		body    []byte
+		link    string
+		noRetry bool
+	}
+	res, err := withRetry(c, ctx, backoff, func() (result, bool, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if err != nil {
+			return result{noRetry: true}, true, err
+		}
+		c.setHeaders(req)
+		if cached.etag != "" {
+			req.Header.Set("If-None-Match", cached.etag)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return result{}, false, err // 网络错误/超时 → 可重试
+		}
+		defer resp.Body.Close()
+		c.noteRateLimit(resp.Header)
+		link := linkNext(resp.Header.Get("Link"))
+		if resp.StatusCode == http.StatusNotModified {
+			return result{body: cached.body, link: cached.link}, false, nil // 304 走缓存（无错误）
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		if rerr != nil {
+			return result{}, false, rerr
+		}
+		if resp.StatusCode >= 500 {
+			return result{}, false, fmt.Errorf("HTTP %d", resp.StatusCode) // 可重试
+		}
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			// 403/429 带 Retry-After：遵守后重试一次
+			if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+				if serr := c.sleep(ctx, ra); serr != nil {
+					return result{noRetry: true}, true, serr
+				}
+				return result{}, false, fmt.Errorf("限流（Retry-After=%v 已等待）", ra)
+			}
+			return result{noRetry: true}, true, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return result{noRetry: true}, true, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode) // 4xx 不重试
+		}
+		if et := resp.Header.Get("ETag"); et != "" {
+			c.etags[fullURL] = etagEntry{etag: et, body: raw, link: link}
+		}
+		return result{body: raw, link: link}, true, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return res.body, res.link, nil
+}
+
+// withRetry：可重试错误（网络/5xx/限流）退避重试；noRetry 直接返回。
+func withRetry[T any](c *Client, ctx context.Context, backoff []time.Duration, attempt func() (T, bool, error)) (T, error) {
+	var zero T
+	res, noRetry, err := attempt()
+	if err == nil {
+		return res, nil
+	}
+	if noRetry {
+		return zero, err
+	}
+	for _, d := range backoff {
+		if serr := c.sleep(ctx, d); serr != nil {
+			return zero, serr
+		}
+		res, noRetry, err = attempt()
+		if err == nil {
+			return res, nil
+		}
+		if noRetry {
+			return zero, err
+		}
+	}
+	return zero, err
+}
+
+func (c *Client) noteRateLimit(h http.Header) {
+	v := h.Get("X-RateLimit-Remaining")
+	if v == "" {
+		return
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return
+	}
+	c.rateMu.Lock()
+	c.rateRemaining = n
+	c.rateMu.Unlock()
+}
+
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }
 
 // Run 是 workflow run 的最小事实（完整观察模型见阶段 2 internal/observe）。
@@ -211,37 +369,18 @@ func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error)
 }
 
 // paginate 逐页请求并回调解析，跟随 Link rel="next"（上限 20 页防御）。
+// 请求统一走 fetch（§3.4.3 重试/ETag/限流）。
 func (c *Client) paginate(ctx context.Context, path string, q url.Values, parse func(json.RawMessage) error) error {
 	next := c.baseURL + "/" + path + "?" + q.Encode()
 	for i := 0; i < 20 && next != ""; i++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
+		body, link, err := c.fetch(ctx, path, next)
 		if err != nil {
 			return err
-		}
-		req.Header.Set("Authorization", "Bearer "+c.token)
-		req.Header.Set("Accept", "application/vnd.github+json")
-		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-		req.Header.Set("User-Agent", c.userAgent)
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return fmt.Errorf("GET %s: %w", path, err)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-		closeErr := resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode)
-		}
-		if readErr != nil {
-			return fmt.Errorf("读取 %s 响应: %w", path, readErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("关闭 %s 响应: %w", path, closeErr)
 		}
 		if err := parse(body); err != nil {
 			return err
 		}
-		next = linkNext(resp.Header.Get("Link"))
+		next = link
 	}
 	return nil
 }

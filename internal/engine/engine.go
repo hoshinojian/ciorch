@@ -16,46 +16,27 @@ import (
 
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
+	"github.com/hoshinojian/ciorch/internal/githubapp"
 	"github.com/hoshinojian/ciorch/internal/observe"
+	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 // PublicTag 是编排器所辖 droplet 的公共 DO tag（§3.5）；编排器自身用
 // ciorch-host（不匹配公共 tag，不计入全局配额）。
 const PublicTag = "ciorch"
 
-// GHFace 是 engine 需要的 GitHub 侧写能力（githubapp.Client 实现，测试可 fake）。
+// GHFace 是 engine 需要的 GitHub 侧写能力（*githubapp.Client 直接实现）。
 type GHFace interface {
 	MintToken(ctx context.Context, repo string) (string, error)
 	RemoveRunner(ctx context.Context, repo string, runnerID int64) error
-	ListRunners(ctx context.Context, repo string) ([]observe.Runner, error)
+	ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error)
 }
 
-// VPSFace 是 engine 需要的 DO 侧写能力（vpsctlapi.Client 实现）。
+// VPSFace 是 engine 需要的 DO 侧写能力（*vpsctlapi.Client 直接实现）。
 type VPSFace interface {
-	Create(ctx context.Context, o CreateOpts) (CreatedDroplet, error)
+	Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error)
 	Delete(ctx context.Context, account, id string) error
-	ListByTag(ctx context.Context, tag, account string) ([]Droplet, error)
-}
-
-// CreateOpts 镜像 vpsctlapi.CreateOpts（解耦 engine 与子进程包，便于 fake）。
-type CreateOpts struct {
-	Account, Region, Size, Image, NamePrefix string
-	StartIndex                               int
-	Tags                                     []string
-	UserDataFile                             string
-}
-
-// CreatedDroplet 是建机受理结果（IP 可空）。
-type CreatedDroplet struct {
-	Account, ID, Name, IPv4Public string
-}
-
-// Droplet 镜像 vpsctlapi.Droplet 的 engine 视图。
-type Droplet struct {
-	Account      string
-	ID, Name     string
-	PriceMonthly float64
-	Tags         []string
+	ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error)
 }
 
 // SSHFace 经系统 ssh 子进程调机器上的 cirunner act（§3.8）。
@@ -238,6 +219,9 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 	name := decide.NextName(repo.NamePrefix(), p.Account, p.Region, convertDroplets(obs.Droplets))
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
+	if e.Renderer == nil {
+		return fmt.Errorf("cloud-init 渲染器未接入（cirunner pkg/cloudinit，阶段 3）——本阶段只允许 dry-run")
+	}
 	token, err := e.GH.MintToken(ctxTO, repo.Repo)
 	if err != nil {
 		return fmt.Errorf("铸 registration token: %w", err)
@@ -262,7 +246,7 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 	if err := os.WriteFile(path, ci, 0o600); err != nil {
 		return err
 	}
-	d, err := e.VPS.Create(ctxTO, CreateOpts{
+	d, err := e.VPS.Create(ctxTO, vpsctlapi.CreateOpts{
 		Account: p.Account, Region: p.Region, Size: p.Size, Image: p.Image,
 		NamePrefix:   repo.NamePrefix(),
 		StartIndex:   nameIndex(repo, p, name),
@@ -300,7 +284,7 @@ func (e *Engine) stateDirOrDefault() string {
 
 // ScanOrphans 场景 J：全局列公共 tag，droplet 不带任何已配置仓 tag → 只告警
 // **绝不删**（等人确认）。
-func (e *Engine) ScanOrphans(ctx context.Context) ([]Droplet, error) {
+func (e *Engine) ScanOrphans(ctx context.Context) ([]vpsctlapi.Droplet, error) {
 	repoTags := map[string]bool{}
 	accounts := map[string]bool{}
 	for _, r := range e.Cfg.Repos {
@@ -308,7 +292,7 @@ func (e *Engine) ScanOrphans(ctx context.Context) ([]Droplet, error) {
 		accounts[e.Cfg.ProfileOf(r).Account] = true
 	}
 	seen := map[string]bool{}
-	var orphans []Droplet
+	var orphans []vpsctlapi.Droplet
 	for acc := range accounts {
 		ds, err := e.VPS.ListByTag(ctx, PublicTag, acc)
 		if err != nil {

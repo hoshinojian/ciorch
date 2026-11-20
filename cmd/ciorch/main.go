@@ -6,14 +6,23 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/budget"
 	"github.com/hoshinojian/ciorch/internal/config"
+	"github.com/hoshinojian/ciorch/internal/daemon"
+	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/observe"
 	"github.com/hoshinojian/ciorch/internal/stats"
+	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 const defaultConfigPath = "/etc/ciorch/ciorch.json"
@@ -68,9 +77,11 @@ func run(args []string) error {
 	fs := flag.NewFlagSet(pa.sub, flag.ContinueOnError)
 	fs.StringVar(&pa.configPath, "config", pa.configPath, "配置文件路径（默认 "+defaultConfigPath+"）")
 	var token, repoFilter, sinceStr string
+	var dryRun bool
 	fs.StringVar(&token, "token", "", "GitHub token（也可 CIORCH_TOKEN / token_file / gh auth token）")
 	fs.StringVar(&repoFilter, "repo", "", "只统计该仓（owner/name，须在配置内）")
 	fs.StringVar(&sinceStr, "since", "7d", "统计窗口（如 7d / 168h / 720h）")
+	fs.BoolVar(&dryRun, "dry-run", false, "daemon：只观察与决策，不执行（shadow 模式）")
 	if err := fs.Parse(pa.subArgs); err != nil {
 		return err
 	}
@@ -81,6 +92,12 @@ func run(args []string) error {
 	switch pa.sub {
 	case "stats":
 		return cmdStats(pa.configPath, token, repoFilter, sinceStr)
+	case "plan":
+		return cmdPlan(pa.configPath, token, repoFilter)
+	case "status":
+		return cmdStatus(pa.configPath, token, repoFilter)
+	case "daemon":
+		return cmdDaemon(pa.configPath, token, dryRun)
 	default:
 		usage()
 		return fmt.Errorf("未知子命令 %q", pa.sub)
@@ -88,11 +105,156 @@ func run(args []string) error {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `ciorch — CI 执行面编排器（阶段 1：stats）
+	fmt.Fprint(os.Stderr, `ciorch — CI 执行面编排器（阶段 2）
 
 用法:
   ciorch [-config path] stats [-repo owner/name] [-since 7d] [-token <tok>]
+  ciorch [-config path] plan   [-repo owner/name]          观察+决策，打印本轮动作（不执行）
+  ciorch [-config path] status [-repo owner/name]          观察并打印各仓 Q/I/P/N 与机器
+  ciorch [-config path] daemon [-dry-run]                  守护循环（-dry-run 只观察决策）
 `)
+}
+
+// wiring 组装真实客户端与执行面（daemon/plan/status 共用）。
+func wiring(cfg *config.Config, token string) (*githubapp.Client, *observe.Collector, *engine.Engine, error) {
+	tok, err := config.ResolveToken(cfg, token, func() (string, error) {
+		return githubapp.GHToken(context.Background(), "gh", nil)
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	gh := githubapp.NewClient(tok)
+	vps := vpsctlapi.NewClient(cfg.VPSctlBin, cfg.VPSctlAccountsFile)
+	collector := &observe.Collector{GH: gh, VPS: &observe.VPSAdapter{Client: vps}}
+	e := engine.New(cfg, gh, vps, sshx{keyFile: cfg.SSHPrivateKeyFile}, nil, log.Default())
+	e.SetCollector(collector)
+	return gh, collector, e, nil
+}
+
+func reposOf(cfg *config.Config, repoFilter string) []config.RepoEntry {
+	var out []config.RepoEntry
+	for _, r := range cfg.Repos {
+		if repoFilter == "" || r.Repo == repoFilter {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func cmdPlan(configPath, token, repoFilter string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	_, _, e, err := wiring(cfg, token)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	for _, r := range reposOf(cfg, repoFilter) {
+		acts, err := e.Reconcile(ctx, r, true, nil) // dry-run：只决策打印
+		if err != nil {
+			return err
+		}
+		fmt.Printf("== %s 本轮动作 ==\n", r.Repo)
+		if len(acts) == 0 {
+			fmt.Println("  （无）")
+		}
+		for _, a := range acts {
+			fmt.Printf("  %-20s %s %s\n", a.Kind, a.DropletName, a.Reason)
+		}
+	}
+	return nil
+}
+
+func cmdStatus(configPath, token, repoFilter string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	_, collector, _, err := wiring(cfg, token)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	for _, r := range reposOf(cfg, repoFilter) {
+		obs, err := collector.Collect(ctx, r, cfg.ProfileOf(r))
+		if err != nil {
+			fmt.Printf("== %s 观察不完整: %v ==\n", r.Repo, err)
+		}
+		Q, QAge := 0, time.Duration(0)
+		for _, j := range obs.Jobs {
+			if j.Status == "queued" {
+				Q++
+				if a := obs.Now.Sub(j.CreatedAt); a > QAge {
+					QAge = a
+				}
+			}
+		}
+		busy, idle, pending := 0, 0, 0
+		for _, r2 := range obs.Runners {
+			if r2.Status == "online" {
+				if r2.Busy {
+					busy++
+				} else {
+					idle++
+				}
+			}
+		}
+		for range obs.Droplets {
+			pending++
+		}
+		fmt.Printf("== %s ==\n  Q=%d QAge=%v 空闲runner=%d 忙runner=%d droplet=%d 未匹配排队=%d pending=%d complete=%v\n",
+			r.Repo, Q, QAge, idle, busy, pending, len(obs.UnmatchedQueued), obs.PendingJobs, obs.Complete)
+		for _, d := range obs.Droplets {
+			fmt.Printf("  droplet %-32s 创建于 %s\n", d.Name, d.CreatedAt.Format(time.RFC3339))
+		}
+	}
+	return nil
+}
+
+func cmdDaemon(configPath, token string, dryRun bool) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	_, collector, e, err := wiring(cfg, token)
+	if err != nil {
+		return err
+	}
+	_ = collector
+	vps := vpsctlapi.NewClient(cfg.VPSctlBin, cfg.VPSctlAccountsFile)
+	b := &budget.Budget{MaxDroplets: cfg.Global.MaxDroplets, DailyBudgetUSD: cfg.Global.DailyBudgetUSD}
+	d := daemon.New(cfg, e, b, vps, log.Default())
+	if dryRun {
+		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	return d.Run(ctx)
+}
+
+// sshx 经系统 ssh 子进程调机器上 cirunner act（§3.8：不维护 known_hosts、
+// 机器一次性；私网优先，缺失用公网——IP 由 engine 侧选好传入）。
+type sshx struct{ keyFile string }
+
+func (s sshx) Act(ctx context.Context, ip, action string) ([]byte, error) {
+	args := []string{
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+	}
+	if s.keyFile != "" {
+		args = append(args, "-i", s.keyFile)
+	}
+	args = append(args, "root@"+ip, "/usr/local/bin/cirunner", "act", action, "--json")
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ssh %s act %s: %w", ip, action, err)
+	}
+	return out, nil
 }
 
 func cmdStats(configPath, token, repoFilter, sinceStr string) error {
