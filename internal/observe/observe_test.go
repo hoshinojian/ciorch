@@ -207,7 +207,7 @@ func TestPartialFailureKeepsOtherLegs(t *testing.T) {
 	gh := &fakeGH{
 		runs:     []githubapp.Run{{ID: 100, Status: "queued", CreatedAt: now.Add(-5 * time.Minute)}},
 		jobs:     map[int64][]githubapp.Job{100: {j(1, "queued", now.Add(-5*time.Minute), "self-hosted", "ci")}},
-		runners:  []githubapp.Runner{{ID: 9, Name: "ci-nms-team2-ci-sgp1-01", Status: "online", Busy: false, Labels: []string{"self-hosted", "ci"}}},
+		runners:  []githubapp.Runner{{ID: 9, Name: "ci-nms-team2-ci-sgp1-01", Status: "online", Busy: false, Labels: []githubapp.RunnerLabel{{ID: 1, Name: "self-hosted"}, {ID: 2, Name: "ci"}}}},
 		failRuns: errors.New("TLS handshake timeout"),
 	}
 	vps := &fakeVPS{droplets: []Droplet{{ID: "7", Name: "ci-nms-team2-ci-sgp1-01", CreatedAt: now.Add(-10 * time.Minute)}}}

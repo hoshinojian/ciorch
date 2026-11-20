@@ -200,7 +200,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 	} else {
 		for _, gr := range ghRunners {
 			obs.Runners = append(obs.Runners, Runner{
-				ID: gr.ID, Name: gr.Name, Status: gr.Status, Busy: gr.Busy, Labels: gr.Labels,
+				ID: gr.ID, Name: gr.Name, Status: gr.Status, Busy: gr.Busy, Labels: gr.LabelNames(),
 			})
 		}
 	}
