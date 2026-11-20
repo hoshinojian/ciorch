@@ -295,7 +295,13 @@ func TestConcurrentReposNoRace(t *testing.T) {
 		{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2},
 		{Repo: "hoshinojian/web", Profile: "go-heavy", MaxRunners: 2},
 	}
-	obsrv := &fakeObs{observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}}
+	// 复审复现条件：观察里有机器（Machines map 会被写），两仓并发 200 轮
+	mname := "ci-nms-team2-ci-sgp1-01"
+	obsrv := &fakeObs{observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true,
+		Droplets: []observe.Droplet{{ID: "d1", Name: mname, CreatedAt: tnow.Add(-30 * time.Minute), PriceMonthly: 141}},
+		Runners:  []observe.Runner{{ID: 42, Name: mname, Status: "online", Busy: false}},
+		Jobs:     []observe.Job{{ID: 1, RunID: 1, Status: "in_progress", CreatedAt: tnow.Add(-20 * time.Minute), StartedAt: tnow.Add(-20 * time.Minute), RunnerName: mname}},
+	}}
 	e := New(cfg, &fakeGH{}, &fakeVPS{}, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(obsrv)
 	var wg sync.WaitGroup
@@ -303,7 +309,7 @@ func TestConcurrentReposNoRace(t *testing.T) {
 		wg.Add(1)
 		go func(repo config.RepoEntry) {
 			defer wg.Done()
-			for i := 0; i < 20; i++ {
+			for i := 0; i < 200; i++ {
 				if _, _, err := e.Reconcile(context.Background(), repo, true); err != nil {
 					t.Errorf("reconcile: %v", err)
 					return

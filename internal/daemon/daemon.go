@@ -26,6 +26,12 @@ const (
 // Clock 注入时间（测试）。
 type Clock func() time.Time
 
+// persisted 是 state.json 的落盘形态（决策记忆 + 当日预算累计）。
+type persisted struct {
+	Repos  map[string]decide.RepoState `json:"repos"`
+	Budget *budget.BudgetSnapshot      `json:"budget,omitempty"`
+}
+
 // Daemon 是守护进程。
 type Daemon struct {
 	Cfg                  *config.Config
@@ -37,6 +43,8 @@ type Daemon struct {
 	Now                  Clock
 	// DryRun = shadow 模式：只观察与决策，不执行任何动作（§3.8）。
 	DryRun bool
+	// RateStatus 返回 GitHub API 限流余量（小时日志观察用；nil = 不打）。
+	RateStatus func() int
 
 	mu        sync.Mutex
 	triggers  map[string]chan struct{}
@@ -79,10 +87,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer unlock()
 
-	// 恢复决策记忆
-	type persisted struct {
-		Repos map[string]decide.RepoState `json:"repos"`
-	}
+	// 恢复决策记忆与当日预算累计
 	var p persisted
 	statePath := filepath.Join(d.Cfg.StateDir, "state.json")
 	if _, err := state.Load(statePath, &p); err != nil {
@@ -91,6 +96,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if p.Repos != nil {
 		d.Engine.States = p.Repos
 	}
+	// 预算当日累计恢复（守护重启不清零——复审修正：此前只在内存）
+	if p.Budget != nil {
+		d.Budget.Restore(d.Now(), *p.Budget)
+		d.Log.Printf("恢复当日预算累计：%s 已花 %.2f USD", p.Budget.DayUTC, p.Budget.SpentToday)
+	}
+	// 每小时打印限流余量（shadow 观察项：24h API 健壮性）
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if d.RateStatus != nil {
+					d.Log.Printf("X-RateLimit-Remaining=%d", d.RateStatus())
+				}
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for _, r := range d.Cfg.Repos {
@@ -138,8 +163,9 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	d.Log.Printf("[%s] Q=%d QAge=%v I=%d P=%d N=%d actions=[%s] complete=%v",
 		repo.Repo, stats.Q, stats.QAge, stats.I, stats.P, stats.N, kindsOf(acts), stats.Complete)
 
-	// 原子写状态（锁内深拷贝快照——复审修正 7）
-	if err := state.Save(statePath, map[string]any{"repos": d.Engine.StatesSnapshot()}); err != nil {
+	// 原子写状态（锁内深拷贝快照 + 当日预算累计）
+	snap := d.Budget.Snapshot(d.Now())
+	if err := state.Save(statePath, persisted{Repos: d.Engine.StatesSnapshot(), Budget: &snap}); err != nil {
 		d.Log.Printf("[%s] 状态持久化失败: %v", repo.Repo, err)
 	}
 	return d.nextInterval(repo, now)

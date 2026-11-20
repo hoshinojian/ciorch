@@ -1,6 +1,7 @@
 package decide
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -198,5 +199,61 @@ func TestLastActivityByRunID(t *testing.T) {
 	_, st3 := Decide(params(), st, o)
 	if len(st3.LastActivity) != 2 {
 		t.Fatalf("两个 run 应两个活动点，got %d", len(st3.LastActivity))
+	}
+}
+
+// 复审修正 7 补漏：Decide 是纯函数，不得修改入参（深拷贝 Machines 与事件
+// 切片——浅拷贝共享底层，锁外写入会与并发快照遍历竞态）。
+func TestDecideDoesNotMutateInput(t *testing.T) {
+	name := "ci-nms-team2-ci-sgp1-01"
+	o := obs()
+	o.Jobs = []observe.Job{queuedJob(1, 3*time.Minute)}
+	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Runners = []observe.Runner{onlineRunner(name, false)}
+	st := RepoState{
+		Machines: map[string]MachineState{name: {
+			FirstOnlineAt: t0.Add(-time.Hour), IdleSince: t0.Add(-30 * time.Minute),
+		}},
+		LastActivity:      []time.Time{t0.Add(-40 * time.Minute)},
+		StallEvents:       []time.Time{t0.Add(-2 * time.Hour)},
+		OfflineEvents:     []time.Time{t0.Add(-3 * time.Hour)},
+		ObserveFailStreak: 3,
+	}
+	before := RepoState{
+		Machines: map[string]MachineState{name: {
+			FirstOnlineAt: t0.Add(-time.Hour), IdleSince: t0.Add(-30 * time.Minute),
+		}},
+		LastActivity:      []time.Time{t0.Add(-40 * time.Minute)},
+		StallEvents:       []time.Time{t0.Add(-2 * time.Hour)},
+		OfflineEvents:     []time.Time{t0.Add(-3 * time.Hour)},
+		ObserveFailStreak: 3,
+	}
+	_, _ = Decide(params(), st, o)
+	if !reflect.DeepEqual(st, before) {
+		t.Fatalf("Decide 修改了入参：\n got %+v\nwant %+v", st, before)
+	}
+}
+
+// R7：Drain 已注销（注册消失）、droplet 还在 → 按 Bad 只重发删除，不记 C 事件。
+func TestDrainDeregisteredNotCountedAsOffline(t *testing.T) {
+	name := "ci-nms-team2-ci-sgp1-01"
+	o := obs()
+	o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
+	// 无 Runners（上一轮 Drain 注销成功，删机延迟）
+	st := RepoState{Machines: map[string]MachineState{name: {
+		FirstOnlineAt: t0.Add(-2 * time.Hour), Remedy: "draining", RemedyAt: t0.Add(-2 * time.Minute),
+	}}}
+	acts, st2 := Decide(params(), st, o)
+	if !hasActionOn(acts, ActDrain, name) {
+		t.Fatalf("应重发删除：%v", acts)
+	}
+	if !st2.Machines[name].Bad {
+		t.Fatal("注销后删机未完应标 Bad（幂等重删）")
+	}
+	if len(st2.OfflineEvents) != 0 {
+		t.Fatalf("不得记 C 事件（假事件会让下次真掉线提前升级）：%v", st2.OfflineEvents)
+	}
+	if hasIncident(acts, "C") {
+		t.Fatal("不得开 C 事故")
 	}
 }

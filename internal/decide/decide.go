@@ -223,8 +223,11 @@ func (m *machineView) allIdleOnline() bool {
 }
 
 // Decide 执行一轮决策。相同 (p, st, obs) 恒定输出 (actions, newState)。
+// 纯函数不修改入参：入口深拷贝 RepoState（Machines map 与三个事件切片——
+// 浅拷贝共享底层数据，锁外写入会与并发快照遍历竞态，复审修正 7 补漏）。
 func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 	p.fillDefaults()
+	st = cloneState(st)
 	if st.Machines == nil {
 		st.Machines = map[string]MachineState{}
 	}
@@ -301,6 +304,19 @@ func actRank(a Action) int {
 	default:
 		return 3
 	}
+}
+
+// cloneState 深拷贝（map 与切片都不共享底层）。
+func cloneState(st RepoState) RepoState {
+	out := st
+	out.Machines = make(map[string]MachineState, len(st.Machines))
+	for k, v := range st.Machines {
+		out.Machines[k] = v
+	}
+	out.LastActivity = append([]time.Time(nil), st.LastActivity...)
+	out.StallEvents = append([]time.Time(nil), st.StallEvents...)
+	out.OfflineEvents = append([]time.Time(nil), st.OfflineEvents...)
+	return out
 }
 
 // buildViews 组装机器视图并维护 IdleSince/BusySince/OfflineSamples/FirstOnlineAt。
