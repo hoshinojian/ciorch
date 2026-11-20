@@ -1,0 +1,213 @@
+// Package daemon 是守护循环（§3.9）：每仓独立定时器，间隔按活跃/空闲动态
+// 切换；每轮 observe → decide → budget → 执行 → 原子写状态；启动取 flock
+// 防双开。webhook 触发（2s 防抖）在阶段 4 接入——Trigger 即为其入口。
+package daemon
+
+import (
+	"context"
+	"log"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/hoshinojian/ciorch/internal/budget"
+	"github.com/hoshinojian/ciorch/internal/config"
+	"github.com/hoshinojian/ciorch/internal/decide"
+	"github.com/hoshinojian/ciorch/internal/engine"
+	"github.com/hoshinojian/ciorch/internal/state"
+)
+
+// 默认轮询间隔（§3.6.6；global.tuning 覆盖在 config 侧解析，此处接口注入）。
+const (
+	defaultPollActive = 15 * time.Second
+	defaultPollIdle   = 60 * time.Second
+)
+
+// Clock 注入时间（测试）。
+type Clock func() time.Time
+
+// Daemon 是守护进程。
+type Daemon struct {
+	Cfg                  *config.Config
+	Engine               *engine.Engine
+	Budget               *budget.Budget
+	Lister               budget.Lister
+	Log                  *log.Logger
+	PollActive, PollIdle time.Duration
+	Now                  Clock
+
+	mu       sync.Mutex
+	triggers map[string]chan struct{}
+}
+
+// New 构造。
+func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, l budget.Lister, lg *log.Logger) *Daemon {
+	if lg == nil {
+		lg = log.Default()
+	}
+	return &Daemon{
+		Cfg: cfg, Engine: e, Budget: b, Lister: l, Log: lg,
+		PollActive: defaultPollActive, PollIdle: defaultPollIdle,
+		Now:      time.Now,
+		triggers: map[string]chan struct{}{},
+	}
+}
+
+// Trigger 请求某仓立即 reconcile（webhook 入口，阶段 4 接入；重复触发合并）。
+func (d *Daemon) Trigger(repo string) {
+	d.mu.Lock()
+	ch := d.triggers[repo]
+	d.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- struct{}{}:
+		default: // 已有待处理的触发，合并
+		}
+	}
+}
+
+// Run 主循环；ctx 取消即退出。
+func (d *Daemon) Run(ctx context.Context) error {
+	lockPath := filepath.Join(d.Cfg.StateDir, "ciorch.lock")
+	unlock, err := state.Lock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// 恢复决策记忆
+	type persisted struct {
+		Repos map[string]decide.RepoState `json:"repos"`
+	}
+	var p persisted
+	statePath := filepath.Join(d.Cfg.StateDir, "state.json")
+	if _, err := state.Load(statePath, &p); err != nil {
+		d.Log.Printf("恢复状态失败（按全新启动）: %v", err)
+	}
+	if p.Repos != nil {
+		d.Engine.States = p.Repos
+	}
+
+	var wg sync.WaitGroup
+	for _, r := range d.Cfg.Repos {
+		ch := make(chan struct{}, 1)
+		d.mu.Lock()
+		d.triggers[r.Repo] = ch
+		d.mu.Unlock()
+		wg.Add(1)
+		go func(repo config.RepoEntry, trigger chan struct{}) {
+			defer wg.Done()
+			d.loopRepo(ctx, repo, trigger, statePath)
+		}(r, ch)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (d *Daemon) loopRepo(ctx context.Context, repo config.RepoEntry, trigger chan struct{}, statePath string) {
+	// 启动即立即 reconcile 一次（§3.9）
+	next := d.round(ctx, repo, statePath)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(next):
+		case <-trigger:
+		}
+		next = d.round(ctx, repo, statePath)
+	}
+}
+
+// round 一轮：reconcile（带全局建机配额）→ 摘要日志 → 持久化 → 返回下轮间隔。
+func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath string) time.Duration {
+	now := d.Now()
+
+	// 全局建机配额：当前 droplet 数对照上限（互斥锁内做全局快照）
+	quota := d.globalQuota(ctx, now)
+
+	acts, err := d.Engine.Reconcile(ctx, repo, false, quota)
+	if err != nil {
+		d.Log.Printf("[%s] reconcile 失败: %v", repo.Repo, err)
+	}
+
+	// 摘要一行（§3.9）
+	summary := d.summary(repo, acts)
+	d.Log.Printf("[%s] %s", repo.Repo, summary)
+
+	// 原子写状态
+	d.mu.Lock()
+	states := d.Engine.States
+	d.mu.Unlock()
+	if err := state.Save(statePath, map[string]any{"repos": states}); err != nil {
+		d.Log.Printf("[%s] 状态持久化失败: %v", repo.Repo, err)
+	}
+	return d.nextInterval(repo, now)
+}
+
+func (d *Daemon) globalQuota(ctx context.Context, now time.Time) *int {
+	accounts := map[string]bool{}
+	for _, r := range d.Cfg.Repos {
+		accounts[d.Cfg.ProfileOf(r).Account] = true
+	}
+	var accs []string
+	for a := range accounts {
+		accs = append(accs, a)
+	}
+	n, err := d.Budget.GlobalCount(ctx, d.Lister, accs)
+	if err != nil {
+		d.Log.Printf("全局配额统计失败（按 0 可用处理，本轮只观察不建）: %v", err)
+		zero := 0
+		return &zero
+	}
+	remaining := d.Cfg.Global.MaxDroplets - n
+	if remaining < 0 {
+		remaining = 0
+	}
+	return &remaining
+}
+
+// active 判定（§3.6.6 poll_active 的条件）：Q>0、冷启在途、有 busy runner
+// 或有未结事故。观察数据拿不到"未结事故"（阶段 5），此处按前三者 + 状态里
+// 有机器处于 remedy。
+func (d *Daemon) active(repo config.RepoEntry) bool {
+	st := d.Engine.States[repo.Repo]
+	for _, m := range st.Machines {
+		if m.Remedy != "" {
+			return true
+		}
+		if !m.BusySince.IsZero() {
+			return true
+		}
+		if m.FirstOnlineAt.IsZero() {
+			return true // 冷启在途
+		}
+	}
+	return false
+}
+
+func (d *Daemon) nextInterval(repo config.RepoEntry, now time.Time) time.Duration {
+	dur := d.PollIdle
+	if d.active(repo) {
+		dur = d.PollActive
+	}
+	return dur
+}
+
+// summary 生成轮摘要（repo=… Q=… 之类的行内数据从 engine 动作反推不够，
+// 摘要的 Q/I/P/N 由观察侧另存——阶段 2 简化为动作列表 + 活跃态）。
+func (d *Daemon) summary(repo config.RepoEntry, acts []decide.Action) string {
+	if len(acts) == 0 {
+		if d.active(repo) {
+			return "actions=[] active=true"
+		}
+		return "actions=[] active=false"
+	}
+	kinds := ""
+	for _, a := range acts {
+		if kinds != "" {
+			kinds += ","
+		}
+		kinds += string(a.Kind)
+	}
+	return "actions=[" + kinds + "]"
+}

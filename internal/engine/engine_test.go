@@ -13,7 +13,9 @@ import (
 
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
+	"github.com/hoshinojian/ciorch/internal/githubapp"
 	"github.com/hoshinojian/ciorch/internal/observe"
+	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 var tnow = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
@@ -30,7 +32,7 @@ type fakeGH struct {
 	token       string
 	removeErr   map[int64]error
 	removed     []int64
-	listRunners []observe.Runner
+	listRunners []githubapp.Runner
 }
 
 func (f *fakeGH) MintToken(ctx context.Context, repo string) (string, error) {
@@ -48,34 +50,34 @@ func (f *fakeGH) RemoveRunner(ctx context.Context, repo string, id int64) error 
 	f.removed = append(f.removed, id)
 	return nil
 }
-func (f *fakeGH) ListRunners(ctx context.Context, repo string) ([]observe.Runner, error) {
+func (f *fakeGH) ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error) {
 	return f.listRunners, nil
 }
 
 type fakeVPS struct {
-	created   []CreateOpts
+	created   []vpsctlapi.CreateOpts
 	deleted   []string
 	order     []string
 	createErr error
-	droplets  []Droplet // ListByTag 结果
+	droplets  []vpsctlapi.Droplet // ListByTag 结果
 }
 
-func (f *fakeVPS) Create(ctx context.Context, o CreateOpts) (CreatedDroplet, error) {
+func (f *fakeVPS) Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error) {
 	if f.createErr != nil {
-		return CreatedDroplet{}, f.createErr
+		return vpsctlapi.Droplet{}, f.createErr
 	}
 	f.created = append(f.created, o)
 	f.order = append(f.order, "create")
-	return CreatedDroplet{Account: o.Account, ID: fmt.Sprintf("id%d", len(f.created)), Name: "ci-nms-team2-ci-sgp1-01", IPv4Public: ""}, nil
+	return vpsctlapi.Droplet{Account: o.Account, ID: fmt.Sprintf("id%d", len(f.created)), Name: "ci-nms-team2-ci-sgp1-01"}, nil
 }
 func (f *fakeVPS) Delete(ctx context.Context, account, id string) error {
 	f.deleted = append(f.deleted, id)
 	f.order = append(f.order, "delete:"+id)
 	return nil
 }
-func (f *fakeVPS) ListByTag(ctx context.Context, tag, account string) ([]Droplet, error) {
+func (f *fakeVPS) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
 	// 贴近 vpsctl 契约：按 tag 精确过滤
-	var out []Droplet
+	var out []vpsctlapi.Droplet
 	for _, d := range f.droplets {
 		for _, tg := range d.Tags {
 			if tg == tag {
@@ -258,7 +260,7 @@ func TestDryRunExecutesNothing(t *testing.T) {
 func TestOrphansReportedNeverDeleted(t *testing.T) {
 	cfg := testCfg(t)
 	repoTag := nmsRepo().Tag()
-	vps := &fakeVPS{droplets: []Droplet{
+	vps := &fakeVPS{droplets: []vpsctlapi.Droplet{
 		{Account: "team2-ci", ID: "1", Name: "mystery-01", Tags: []string{"ciorch"}},                       // 孤儿
 		{Account: "team2-ci", ID: "2", Name: "ci-nms-team2-ci-sgp1-01", Tags: []string{"ciorch", repoTag}}, // 正常
 		{Account: "team2-ci", ID: "3", Name: "ciorch-host-1", Tags: []string{"ciorch-host"}},               // 编排器自身（不列出来）
