@@ -8,6 +8,15 @@ import (
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
+// firstRunnerID 取机器首个注册的 runner id（Drain/ForceDelete 注销用；
+// rpd=2 的其余实例由 engine 按名清理）。
+func firstRunnerID(m *machineView) int64 {
+	for _, r := range m.runners {
+		return r.ID
+	}
+	return 0
+}
+
 // scenarioC 掉线：曾 online、当前 offline（或注册消失）连续 OfflineSamples 轮
 // → 先建后拆（同 B），不计熔断；同仓 24h 内第 2 次 → 事故。
 func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, emit func(Action), remedied map[string]bool) {
@@ -34,7 +43,7 @@ func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
 		st.Machines[name] = ms
 		emit(Action{
-			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name,
+			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
 			Reason: "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）",
 		})
 		if countRecent(st.OfflineEvents, obs.Now, stallHistoryWindow) >= 2 {
@@ -69,7 +78,7 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
 		st.Machines[name] = ms
 		emit(Action{
-			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name,
+			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
 			Reason: "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）",
 		})
 		// 熔断计数（C 不计入）
@@ -116,7 +125,7 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 				ms.Remedy = "draining"
 				st.Machines[name] = ms
 				emit(Action{
-					Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name,
+					Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
 					Reason: "场景 A 假活：重启观察窗后仍不接活，判死回收（先注销后删机）",
 				})
 				remedied[name] = true
@@ -182,7 +191,7 @@ func scenarioD(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			ms.Remedy, ms.RemedyAt = "draining", obs.Now
 			st.Machines[name] = ms
 			emit(Action{
-				Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name,
+				Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
 				Reason: "场景 D job 卡死：busy 超过击杀线，强删机器（先删机再清注册，job 已判死）",
 			})
 		}
@@ -275,7 +284,8 @@ func scaling(p Params, st *RepoState, obs observe.Obs, views map[string]*machine
 			st.Machines[oldestName] = ms
 			emit(Action{
 				Kind: ActDrain, DropletID: views[oldestName].droplet.ID, DropletName: oldestName,
-				Reason: "空闲回收：无排队且 runner 空闲超时（一轮只回收最老一台）",
+				RunnerID: firstRunnerID(views[oldestName]),
+				Reason:   "空闲回收：无排队且 runner 空闲超时（一轮只回收最老一台）",
 			})
 		}
 	}
@@ -292,7 +302,7 @@ func scaling(p Params, st *RepoState, obs observe.Obs, views map[string]*machine
 			ms.Remedy, ms.RemedyAt = "draining", obs.Now
 			st.Machines[name] = ms
 			emit(Action{
-				Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name,
+				Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
 				Reason: "硬寿命到期：机器年龄超上限且回收窗口（观察不完整也执行，防成本泄漏）",
 			})
 		} else if age >= p.MaxLifetime+lifetimeOverrunAlert {

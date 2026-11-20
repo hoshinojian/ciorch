@@ -135,6 +135,60 @@ func (c *Client) ListJobs(ctx context.Context, repo string, runID int64) ([]Job,
 	return out, nil
 }
 
+// MintToken 铸 runner registration token（1h 时效，建机瞬间现铸现用，§2.3）。
+func (c *Client) MintToken(ctx context.Context, repo string) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("repos/%s/actions/runners/registration-token", repo), &out); err != nil {
+		return "", fmt.Errorf("铸 registration token: %w", err)
+	}
+	if len(out.Token) < 16 {
+		return "", fmt.Errorf("registration token 异常（长度 %d）", len(out.Token))
+	}
+	return out.Token, nil
+}
+
+// RemoveRunner 删除 runner 注册（Drain 第一步/清残留，§3.8）。
+func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) error {
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf("repos/%s/actions/runners/%d", repo, runnerID), nil)
+}
+
+// do 是非 GET 端点的薄封装（无分页）。
+func (c *Client) do(ctx context.Context, method, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/"+path, nil)
+	if err != nil {
+		return err
+	}
+	c.setHeaders(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", method, path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
+	}
+	if out == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	return json.Unmarshal(body, out)
+}
+
+func (c *Client) setHeaders(req *http.Request) {
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", c.userAgent)
+}
+
 // ListRunners 返回仓内全部 runner 注册（含 labels，§3.4.4）。
 func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error) {
 	var out []Runner
