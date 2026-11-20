@@ -16,6 +16,8 @@ import (
 	"github.com/hoshinojian/ciorch/internal/stats"
 )
 
+const defaultConfigPath = "/etc/ciorch/ciorch.json"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "ciorch:", err)
@@ -23,15 +25,19 @@ func main() {
 	}
 }
 
-func run(args []string) error {
-	if len(args) == 0 {
-		usage()
-		return fmt.Errorf("缺少子命令")
-	}
-	// -config 允许出现在子命令前后（同 cirunner 原型惯例）；
-	// 支持 -config=path 与 -config path 两种形式。
+// parsedArgs 是 parseArgs 的产物：全局 -config 已剥离，rest 首元素为子命令。
+type parsedArgs struct {
+	configPath string
+	sub        string
+	subArgs    []string
+}
+
+// parseArgs 解析全局 -config（允许出现在子命令前后，支持 -config=path 与
+// -config path 两种形式）并定位子命令。无子命令（含只有全局 flag）返回错误，
+// 不 panic——审查修正 3：`ciorch -config x` 曾 index out of range。
+func parseArgs(args []string) (parsedArgs, error) {
 	var configPath string
-	rest := args
+	rest := append([]string{}, args...)
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		switch {
@@ -46,28 +52,38 @@ func run(args []string) error {
 		}
 		break
 	}
-	sub := rest[0]
-	subArgs := rest[1:]
+	if len(rest) == 0 || strings.HasPrefix(rest[0], "-") {
+		return parsedArgs{}, fmt.Errorf("缺少子命令（可用：stats）")
+	}
+	return parsedArgs{configPath: configPath, sub: rest[0], subArgs: rest[1:]}, nil
+}
 
-	fs := flag.NewFlagSet(sub, flag.ContinueOnError)
-	fs.StringVar(&configPath, "config", configPath, "配置文件路径（默认 /etc/ciorch/ciorch.json）")
+func run(args []string) error {
+	pa, err := parseArgs(args)
+	if err != nil {
+		usage()
+		return err
+	}
+
+	fs := flag.NewFlagSet(pa.sub, flag.ContinueOnError)
+	fs.StringVar(&pa.configPath, "config", pa.configPath, "配置文件路径（默认 "+defaultConfigPath+"）")
 	var token, repoFilter, sinceStr string
 	fs.StringVar(&token, "token", "", "GitHub token（也可 CIORCH_TOKEN / token_file / gh auth token）")
 	fs.StringVar(&repoFilter, "repo", "", "只统计该仓（owner/name，须在配置内）")
 	fs.StringVar(&sinceStr, "since", "7d", "统计窗口（如 7d / 168h / 720h）")
-	if err := fs.Parse(subArgs); err != nil {
+	if err := fs.Parse(pa.subArgs); err != nil {
 		return err
 	}
-	if configPath == "" {
-		configPath = "/etc/ciorch/ciorch.json"
+	if pa.configPath == "" {
+		pa.configPath = defaultConfigPath
 	}
 
-	switch sub {
+	switch pa.sub {
 	case "stats":
-		return cmdStats(configPath, token, repoFilter, sinceStr)
+		return cmdStats(pa.configPath, token, repoFilter, sinceStr)
 	default:
 		usage()
-		return fmt.Errorf("未知子命令 %q", sub)
+		return fmt.Errorf("未知子命令 %q", pa.sub)
 	}
 }
 
@@ -100,23 +116,27 @@ func cmdStats(configPath, token, repoFilter, sinceStr string) error {
 
 	client := githubapp.NewClient(tok)
 	now := time.Now()
-	for _, repo := range cfg.Repos {
-		if repoFilter != "" && repo != repoFilter {
+	for _, re := range cfg.Repos {
+		if repoFilter != "" && re.Repo != repoFilter {
 			continue
 		}
-		runs, err := client.ListRuns(ctx, repo, now.Add(-since))
+		runs, err := client.ListRuns(ctx, re.Repo, now.Add(-since))
 		if err != nil {
-			return fmt.Errorf("%s 列 runs: %w", repo, err)
+			return fmt.Errorf("%s 列 runs: %w", re.Repo, err)
 		}
 		var sr []stats.Run
 		for _, r := range runs {
-			jobs, err := client.ListJobs(ctx, repo, r.ID)
+			jobs, err := client.ListJobs(ctx, re.Repo, r.ID)
 			if err != nil {
-				return fmt.Errorf("%s run %d 列 jobs: %w", repo, r.ID, err)
+				return fmt.Errorf("%s run %d 列 jobs: %w", re.Repo, r.ID, err)
 			}
-			sr = append(sr, stats.Run{ID: r.ID, CreatedAt: r.CreatedAt, Jobs: convertJobs(jobs)})
+			sr = append(sr, stats.Run{
+				ID: r.ID, RunAttempt: r.RunAttempt,
+				CreatedAt: r.CreatedAt, RunStartedAt: r.RunStartedAt,
+				Jobs: convertJobs(jobs),
+			})
 		}
-		printReport(stats.Compute(repo, sr), len(runs), since)
+		printReport(stats.Compute(re.Repo, sr), len(runs), since)
 	}
 	return nil
 }
@@ -140,6 +160,10 @@ func printReport(rep stats.Report, runsFetched int, since time.Duration) {
 	fmt.Printf("run 总时长 p50=%-8v p95=%-8v max=%v\n", rep.RunTotalP50, rep.RunTotalP95, rep.RunTotalMax)
 	fmt.Printf("冷启代理（新机器首 job 等待） n=%d avg=%v max=%v\n",
 		rep.ColdStart.Samples, rep.ColdStart.Avg, rep.ColdStart.Max)
+	if rep.RerunRuns > 0 || rep.RerunExcludedJobs > 0 {
+		fmt.Printf("重跑 run %d（总时长按最新 attempt 起点）；因重跑排除 job %d 个（旧 attempt started_at 失真）\n",
+			rep.RerunRuns, rep.RerunExcludedJobs)
+	}
 	names := make([]string, 0, len(rep.ByJob))
 	for n := range rep.ByJob {
 		names = append(names, n)
@@ -162,6 +186,9 @@ func parseWindow(s string) (time.Duration, error) {
 	d, err := time.ParseDuration(s)
 	if err != nil {
 		return 0, fmt.Errorf("解析 -since %q: 支持 Nd 或 Go duration", s)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("解析 -since %q: 窗口必须为正", s)
 	}
 	return d, nil
 }

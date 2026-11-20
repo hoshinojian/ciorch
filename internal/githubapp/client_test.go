@@ -27,7 +27,7 @@ func TestListRunsPaginatesLinkHeader(t *testing.T) {
 		}
 		if r.URL.Query().Get("page") == "" || r.URL.Query().Get("page") == "1" {
 			w.Header().Set("Link", `<`+srvBase(r)+`/repos/a/b/actions/runs?per_page=100&page=2>; rel="next"`)
-			w.Write([]byte(`{"total_count":3,"workflow_runs":[{"id":1,"created_at":"2026-11-18T00:00:00Z"},{"id":2,"created_at":"2026-11-19T00:00:00Z"}]}`))
+			w.Write([]byte(`{"total_count":3,"workflow_runs":[{"id":1,"created_at":"2026-11-18T00:00:00Z","run_attempt":1,"run_started_at":"2026-11-18T00:00:05Z"},{"id":2,"created_at":"2026-11-19T00:00:00Z","run_attempt":2,"run_started_at":"2026-11-19T02:00:00Z"}]}`))
 			return
 		}
 		w.Write([]byte(`{"total_count":3,"workflow_runs":[{"id":3,"created_at":"2026-11-20T00:00:00Z"}]}`))
@@ -42,6 +42,13 @@ func TestListRunsPaginatesLinkHeader(t *testing.T) {
 	}
 	if len(runs) != 3 || runs[2].ID != 3 {
 		t.Fatalf("两页应合并 3 个 run: %+v", runs)
+	}
+	// 重跑字段解析（run_attempt / run_started_at，缺省零值兼容）
+	if runs[1].RunAttempt != 2 || !runs[1].RunStartedAt.Equal(time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)) {
+		t.Fatalf("重跑字段解析不对: %+v", runs[1])
+	}
+	if runs[2].RunAttempt != 0 || !runs[2].RunStartedAt.IsZero() {
+		t.Fatalf("缺省重跑字段应为零值: %+v", runs[2])
 	}
 }
 

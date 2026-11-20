@@ -140,6 +140,80 @@ func TestRunTotalFromJobs(t *testing.T) {
 	}
 }
 
+// 重跑失真排除（审查修正 1）：filter=latest 下未被重跑的 job 保留旧 attempt 的
+// started_at、created_at 刷新为新 attempt 时间 → started < created 为负。
+// 负值不得进入排队等待/冷启/分 job 样本，单列计数（2026-11-20 真实数据：
+// 4 个重跑 run 约 24 个负值 job，曾把 p50 拉低）。
+func TestRerunExcludesNegativeWaits(t *testing.T) {
+	runs := []Run{{
+		ID: 1, RunAttempt: 2, CreatedAt: t0.Add(2 * time.Hour), RunStartedAt: t0.Add(2*time.Hour + time.Minute),
+		Jobs: []Job{
+			// 重跑的 job：时间对齐，排队 5m，有效
+			job("test", 2*time.Hour, 2*time.Hour+5*time.Minute, 2*time.Hour+17*time.Minute, "r1"),
+			// 未重跑的 job：started 保留 attempt-1（10:43），created 刷新（12:00）→ 负值
+			{ID: 2, Name: "lint", CreatedAt: t0.Add(2 * time.Hour), StartedAt: t0.Add(time.Hour + 43*time.Minute), CompletedAt: t0.Add(time.Hour + 44*time.Minute), RunnerID: 9, RunnerName: "r1"},
+		},
+	}}
+	rep := Compute("a/b", runs)
+	if rep.RerunExcludedJobs != 1 {
+		t.Fatalf("应排除 1 个负值 job，got %d", rep.RerunExcludedJobs)
+	}
+	if rep.JobsStarted != 1 {
+		t.Fatalf("有效样本应 1，got %d", rep.JobsStarted)
+	}
+	if rep.QueueWaitP50 != 5*time.Minute || rep.QueueWaitMax != 5*time.Minute {
+		t.Fatalf("排队等待应只含有效样本: %+v", rep)
+	}
+	if rep.ColdStart.Samples != 1 || rep.ColdStart.Avg != 5*time.Minute {
+		t.Fatalf("冷启样本不得混入负值: %+v", rep.ColdStart)
+	}
+	if rep.ByJob["lint"].N != 0 {
+		t.Fatalf("分 job 统计不应含排除样本: %+v", rep.ByJob)
+	}
+}
+
+// 重跑 run 总时长（审查修正 2）：起点用最新 attempt 的 run_started_at，
+// 不把两次 attempt 之间的间隔算进去（43586538809：10:42 创建、12:29 才开
+// attempt 2，旧口径虚高 1h47m）。
+func TestRerunRunTotalFromRunStartedAt(t *testing.T) {
+	create := t0                     // 10:42（原始创建）
+	at2 := t0.Add(107 * time.Minute) // 12:29（attempt 2 开始）
+	runs := []Run{{
+		ID: 43586538809, RunAttempt: 2, CreatedAt: create, RunStartedAt: at2,
+		Jobs: []Job{
+			// 重跑的 job：attempt 2 内 12:30 开跑 13:00 完成
+			job("test", 107*time.Minute, 108*time.Minute, 138*time.Minute, "r1"),
+			// 未重跑的 job：attempt 1 遗留（11:00 完成，早于 attempt 2 起点，不影响 max）
+			{ID: 2, Name: "lint", CreatedAt: at2, StartedAt: t0.Add(43 * time.Minute), CompletedAt: t0.Add(78 * time.Minute), RunnerID: 9, RunnerName: "r1"},
+		},
+	}}
+	rep := Compute("a/b", runs)
+	if rep.RerunRuns != 1 {
+		t.Fatalf("重跑 run 应计 1，got %d", rep.RerunRuns)
+	}
+	want := 138*time.Minute - 107*time.Minute // 13:00 - 12:29 = 31m
+	if rep.RunTotalMax != want {
+		t.Fatalf("run 总时长应按 run_started_at 起点（31m），got %v", rep.RunTotalMax)
+	}
+	if rep.RerunExcludedJobs != 1 {
+		t.Fatalf("attempt-1 遗留 job 应被排除计数，got %d", rep.RerunExcludedJobs)
+	}
+}
+
+// run_started_at 缺失（零值）时退回 created_at（兼容旧调用方/缺字段）。
+func TestRunTotalFallsBackToCreatedAt(t *testing.T) {
+	runs := []Run{{ID: 1, CreatedAt: t0, Jobs: []Job{
+		job("test", 0, 2*time.Minute, 14*time.Minute, "r1"),
+	}}}
+	rep := Compute("a/b", runs)
+	if rep.RunTotalMax != 14*time.Minute {
+		t.Fatalf("无 run_started_at 应退回 created_at，got %v", rep.RunTotalMax)
+	}
+	if rep.RerunRuns != 0 {
+		t.Fatalf("非重跑 run 不应计数，got %d", rep.RerunRuns)
+	}
+}
+
 // 分 job 名统计：定位哪个 job 是排队大头。
 func TestByJobBreakdown(t *testing.T) {
 	runs := []Run{{CreatedAt: t0, Jobs: []Job{

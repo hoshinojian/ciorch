@@ -53,9 +53,11 @@ func NewClient(token string, opts ...Option) *Client {
 
 // Run 是 workflow run 的最小事实（完整观察模型见阶段 2 internal/observe）。
 type Run struct {
-	ID        int64     `json:"id"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           int64     `json:"id"`
+	Status       string    `json:"status"`
+	RunAttempt   int       `json:"run_attempt"`
+	CreatedAt    time.Time `json:"created_at"`
+	RunStartedAt time.Time `json:"run_started_at"`
 }
 
 // Job 是 jobs 接口条目（阶段 1 字段：排队等待与冷启代理所需）。
