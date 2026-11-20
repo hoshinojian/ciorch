@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/githubapp"
+
 	"github.com/hoshinojian/ciorch/internal/budget"
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
@@ -43,8 +45,8 @@ type Daemon struct {
 	Now                  Clock
 	// DryRun = shadow 模式：只观察与决策，不执行任何动作（§3.8）。
 	DryRun bool
-	// RateStatus 返回 GitHub API 限流余量（小时日志观察用；nil = 不打）。
-	RateStatus func() int
+	// Usage 返回并清零一小时用量统计（nil = 不打小时日志）。
+	Usage func() githubapp.UsageStats
 
 	mu        sync.Mutex
 	triggers  map[string]chan struct{}
@@ -110,8 +112,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if d.RateStatus != nil {
-					d.Log.Printf("X-RateLimit-Remaining=%d", d.RateStatus())
+				if d.Usage != nil {
+					u := d.Usage()
+					d.Log.Printf("api-usage 1h: requests=%d 304=%d remaining %d→%d",
+						u.Requests, u.NotModified, u.RemainingStart, u.RemainingEnd)
 				}
 			}
 		}

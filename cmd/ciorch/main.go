@@ -237,7 +237,7 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	}
 	e.Gate = budget.NewGate(b, vps, accs) // 全局配额+预算互斥闸门（复审修正 8）
 	d := daemon.New(cfg, e, b, vps, log.Default())
-	d.RateStatus = ghClient.RateRemaining // 每小时限流余量日志（shadow 观察项）
+	d.Usage = ghClient.SwapUsage // 每小时用量日志：requests/304/Remaining 首尾（V3 推法）
 	if dryRun {
 		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")
 		d.DryRun = true // 透传到每轮 Reconcile——此前只打印提示仍是真执行（审查修正 1）
