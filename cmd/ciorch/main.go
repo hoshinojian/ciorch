@@ -28,15 +28,23 @@ func run(args []string) error {
 		usage()
 		return fmt.Errorf("缺少子命令")
 	}
-	// -config 允许出现在子命令前后（同 cirunner 原型惯例）。
+	// -config 允许出现在子命令前后（同 cirunner 原型惯例）；
+	// 支持 -config=path 与 -config path 两种形式。
 	var configPath string
 	rest := args
-	for i, a := range args {
-		if strings.HasPrefix(a, "-config=") {
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		switch {
+		case strings.HasPrefix(a, "-config="):
 			configPath = strings.TrimPrefix(a, "-config=")
-			rest = append(append([]string{}, args[:i]...), args[i+1:]...)
-			break
+			rest = append(append([]string{}, rest[:i]...), rest[i+1:]...)
+		case a == "-config" && i+1 < len(rest):
+			configPath = rest[i+1]
+			rest = append(append([]string{}, rest[:i]...), rest[i+2:]...)
+		default:
+			continue
 		}
+		break
 	}
 	sub := rest[0]
 	subArgs := rest[1:]
@@ -119,7 +127,7 @@ func convertJobs(jobs []githubapp.Job) []stats.Job {
 		out = append(out, stats.Job{
 			ID: j.ID, Name: j.Name, CreatedAt: j.CreatedAt,
 			StartedAt: j.StartedAt, CompletedAt: j.CompletedAt,
-			RunnerName: j.RunnerName,
+			RunnerID: j.RunnerID, RunnerName: j.RunnerName,
 		})
 	}
 	return out

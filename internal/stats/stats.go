@@ -9,6 +9,7 @@
 package stats
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -28,6 +29,7 @@ type Job struct {
 	CreatedAt   time.Time
 	StartedAt   time.Time // 零值 = 从未开跑
 	CompletedAt time.Time
+	RunnerID    int64 // GitHub 注册 id：删机重建后名字可能复用（-01 反复从 01 起），id 必新
 	RunnerName  string
 }
 
@@ -86,8 +88,14 @@ func Compute(repo string, runs []Run) Report {
 				queueWaits = append(queueWaits, w)
 				perJob[j.Name] = append(perJob[j.Name], w)
 				rep.JobsStarted++
-				if j.RunnerName != "" && !seenRunner[j.RunnerName] {
-					seenRunner[j.RunnerName] = true
+				// 冷启代理按 runner 注册身份判"新机器"：优先 runner_id（删机
+				// 重建后名字会复用，id 不会）；id 缺失时退回名字（不重数即漏数）。
+				key := j.RunnerName
+				if j.RunnerID != 0 {
+					key = fmt.Sprintf("id:%d", j.RunnerID)
+				}
+				if key != "" && !seenRunner[key] {
+					seenRunner[key] = true
 					coldWaits = append(coldWaits, w)
 				}
 			}
