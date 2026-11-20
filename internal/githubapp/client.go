@@ -37,6 +37,66 @@ type Client struct {
 	etags         map[string]etagEntry
 	rateMu        sync.Mutex
 	rateRemaining int // 最近一次响应的 X-RateLimit-Remaining（-1=未知）
+
+	// 用量统计（§11 V3：304 次数 × Remaining 实际下降量 → 304 是否扣额度）
+	useMu        sync.Mutex
+	useRequests  int   // 发出的 HTTP 请求数（含重试/翻页）
+	useNotMod    int   // 304 响应数
+	useRemainWin []int // 窗口内观察到的 Remaining 序列（首尾取自这里）
+}
+
+// UsageStats 是一个统计窗口的用量快照。
+type UsageStats struct {
+	Requests       int
+	NotModified    int
+	RemainingStart int // 窗口首个 Remaining（-1=未见）
+	RemainingEnd   int // 窗口最新 Remaining（-1=未见）
+}
+
+// Usage 返回当前窗口统计（不清零）。
+func (c *Client) Usage() UsageStats {
+	c.useMu.Lock()
+	defer c.useMu.Unlock()
+	return c.usageLocked()
+}
+
+// SwapUsage 返回当前窗口统计并清零（小时日志用）。
+func (c *Client) SwapUsage() UsageStats {
+	c.useMu.Lock()
+	defer c.useMu.Unlock()
+	u := c.usageLocked()
+	c.useRequests, c.useNotMod, c.useRemainWin = 0, 0, nil
+	return u
+}
+
+func (c *Client) usageLocked() UsageStats {
+	c.rateMu.Lock()
+	remain := c.rateRemaining
+	c.rateMu.Unlock()
+	u := UsageStats{
+		Requests:       c.useRequests,
+		NotModified:    c.useNotMod,
+		RemainingStart: -1,
+		RemainingEnd:   remain,
+	}
+	if len(c.useRemainWin) > 0 {
+		u.RemainingStart = c.useRemainWin[0]
+		u.RemainingEnd = c.useRemainWin[len(c.useRemainWin)-1]
+	}
+	return u
+}
+
+// noteRequest 记一次实际发出的请求与其结果（304 与否）。
+func (c *Client) noteRequest(notModified bool, remainingSeen int) {
+	c.useMu.Lock()
+	c.useRequests++
+	if notModified {
+		c.useNotMod++
+	}
+	if remainingSeen >= 0 {
+		c.useRemainWin = append(c.useRemainWin, remainingSeen)
+	}
+	c.useMu.Unlock()
 }
 
 type etagEntry struct {
@@ -121,14 +181,21 @@ func (c *Client) fetch(ctx context.Context, path, fullURL string) ([]byte, strin
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			c.noteRequest(false, -1)
 			return result{}, false, err // 网络错误/超时 → 可重试
 		}
 		defer resp.Body.Close()
 		c.noteRateLimit(resp.Header)
+		rem := -1
+		if v, err := strconv.Atoi(resp.Header.Get("X-RateLimit-Remaining")); err == nil {
+			rem = v
+		}
 		link := linkNext(resp.Header.Get("Link"))
 		if resp.StatusCode == http.StatusNotModified {
+			c.noteRequest(true, rem)
 			return result{body: cached.body, link: cached.link}, false, nil // 304 走缓存（无错误）
 		}
+		c.noteRequest(false, rem)
 		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		if rerr != nil {
 			return result{}, false, rerr

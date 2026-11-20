@@ -2,6 +2,7 @@ package githubapp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -145,5 +146,52 @@ func TestListRunnersLabelsAreObjects(t *testing.T) {
 	names := rs[0].LabelNames()
 	if len(names) != 2 || names[0] != "self-hosted" || names[1] != "ci" {
 		t.Fatalf("label 名解析不对: %v", names)
+	}
+}
+
+// 用量统计（V3 推法的数据源）：请求数/304 数/Remaining 首尾；Swap 清零。
+func TestUsageStats(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		w.Header().Set("X-RateLimit-Remaining", fmt.Sprintf("%d", 100-int(n)))
+		if n == 2 {
+			w.Header().Set("ETag", `"v1"`)
+		}
+		if n >= 3 && r.Header.Get("If-None-Match") == `"v1"` {
+			w.WriteHeader(304)
+			return
+		}
+		w.Write([]byte(`{"runners":[]}`))
+	}))
+	defer srv.Close()
+	c := NewClient("TESTTOKEN123456", WithBaseURL(srv.URL))
+	zeroSleep(c)
+	// 三次请求：2 次正常 + 1 次 304（第二次存了 ETag）
+	for i := 0; i < 2; i++ {
+		if _, err := c.ListRunners(context.Background(), "a/b"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.ListRunners(context.Background(), "a/b"); err != nil {
+		t.Fatal(err)
+	}
+	u := c.Usage()
+	if u.Requests != 3 {
+		t.Fatalf("应记 3 次请求，got %d", u.Requests)
+	}
+	if u.NotModified != 1 {
+		t.Fatalf("应记 1 次 304，got %d", u.NotModified)
+	}
+	if u.RemainingStart != 99 || u.RemainingEnd != 97 {
+		t.Fatalf("Remaining 首尾不对: %+v", u)
+	}
+	// Swap 清零
+	u2 := c.SwapUsage()
+	if u2.Requests != 3 || u2.NotModified != 1 {
+		t.Fatalf("Swap 应返回统计: %+v", u2)
+	}
+	if u3 := c.Usage(); u3.Requests != 0 || u3.NotModified != 0 || u3.RemainingStart != -1 {
+		t.Fatalf("Swap 后应清零: %+v", u3)
 	}
 }
