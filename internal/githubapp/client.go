@@ -233,13 +233,30 @@ type Job struct {
 	Labels      []string  `json:"labels"`
 }
 
+// RunnerLabel 是 runners API 的 label 条目——**对象不是字符串**
+// （shadow 实录 2026-11-20：`{"id":1,"name":"self-hosted"}`，此前按 []string
+// 解析，一有 runner 注册 runners 路即失败）。
+type RunnerLabel struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
 // Runner 是 runners 接口条目（本仓全部注册，含外部——归属过滤由 observe/decide 做）。
 type Runner struct {
-	ID     int64    `json:"id"`
-	Name   string   `json:"name"`
-	Status string   `json:"status"` // online | offline
-	Busy   bool     `json:"busy"`
-	Labels []string `json:"labels"`
+	ID     int64         `json:"id"`
+	Name   string        `json:"name"`
+	Status string        `json:"status"` // online | offline
+	Busy   bool          `json:"busy"`
+	Labels []RunnerLabel `json:"labels"`
+}
+
+// LabelNames 取 label 名列表（observe 侧消费字符串）。
+func (r Runner) LabelNames() []string {
+	out := make([]string, 0, len(r.Labels))
+	for _, l := range r.Labels {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 // ListRuns 返回 since 之后创建的全部 run（按 created>= 服务端过滤 + 客户端兜底）。

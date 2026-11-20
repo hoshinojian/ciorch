@@ -129,3 +129,21 @@ func TestRateRemainingExposed(t *testing.T) {
 		t.Fatalf("应读到 42，got %d", c.RateRemaining())
 	}
 }
+
+// shadow 实录回归（2026-11-20）：runners API 的 labels 是对象数组
+// （{"id","name"}），按 []string 解析会在一有 runner 注册时炸掉 runners 路。
+func TestListRunnersLabelsAreObjects(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"runners":[{"id":42,"name":"ci-nms-team2-ci-sgp1-01","status":"online","busy":false,"labels":[{"id":1,"name":"self-hosted"},{"id":2,"name":"ci"}]}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient("TESTTOKEN123456", WithBaseURL(srv.URL))
+	rs, err := c.ListRunners(context.Background(), "a/b")
+	if err != nil {
+		t.Fatalf("对象 labels 必须可解析: %v", err)
+	}
+	names := rs[0].LabelNames()
+	if len(names) != 2 || names[0] != "self-hosted" || names[1] != "ci" {
+		t.Fatalf("label 名解析不对: %v", names)
+	}
+}
