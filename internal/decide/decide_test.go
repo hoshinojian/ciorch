@@ -510,16 +510,19 @@ func TestNeverOnlineIsBNotC(t *testing.T) {
 
 // ---------- 场景 D job 卡死（§8.1）----------
 
-// 59m 不告、61m 告、91m ForceDelete。
+// 59m 不告、61m 告、91m ForceDelete（口径：本机 in_progress job 的 StartedAt，
+// 复审修正 3——机器级 BusySince 会误杀连续接单的健康机器）。
 func TestJobStuckThresholds(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
-	mk := func(busy time.Duration) (observe.Obs, RepoState) {
+	mk := func(jobAge time.Duration) (observe.Obs, RepoState) {
 		o := obs()
 		o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
 		o.Runners = []observe.Runner{onlineRunner(name, true)}
-		st := RepoState{Machines: map[string]MachineState{name: {
-			FirstOnlineAt: t0.Add(-2 * time.Hour), BusySince: t0.Add(-busy),
-		}}}
+		o.Jobs = []observe.Job{{
+			ID: 5, RunID: 1, Status: "in_progress", RunnerName: name,
+			CreatedAt: t0.Add(-jobAge), StartedAt: t0.Add(-jobAge),
+		}}
+		st := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-2 * time.Hour)}}}
 		return o, st
 	}
 	for _, c := range []struct {
