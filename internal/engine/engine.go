@@ -238,7 +238,10 @@ func (e *Engine) StatesSnapshot() map[string]decide.RepoState {
 }
 
 // execute 按序执行动作；动作隔离（§3.8）：失败记日志/回填，不中断。
+// createdInRound 累积本轮已建机名：取名基于本轮观察快照，同轮后续 create
+// 必须看到先前 create 的名字，否则同名（GitHub 拒绝重名注册 → 僵尸机）。
 func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe.Obs, acts []decide.Action) {
+	var createdInRound []string
 	for _, a := range acts {
 		switch a.Kind {
 		case decide.ActCreate:
@@ -260,7 +263,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 					}
 					continue
 				}
-				created, err := e.create(ctx, repo, obs)
+				created, err := e.create(ctx, repo, obs, createdInRound)
 				if err != nil {
 					e.Gate.Abort(res)
 					e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
@@ -275,10 +278,11 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 					e.mu.Unlock()
 					continue
 				}
+				createdInRound = append(createdInRound, created)
 				e.Gate.Commit(res, created) // 占坑保留到列表可见/TTL
 				continue
 			}
-			if _, err := e.create(ctx, repo, obs); err != nil {
+			if created, err := e.create(ctx, repo, obs, createdInRound); err != nil {
 				e.Log.Printf("[%s] 建机失败: %v", repo.Repo, err)
 				e.mu.Lock()
 				st := e.States[repo.Repo]
@@ -289,6 +293,8 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 				e.mu.Lock()
 				e.States[repo.Repo] = st
 				e.mu.Unlock()
+			} else {
+				createdInRound = append(createdInRound, created)
 			}
 		case decide.ActDrain:
 			// 先注销注册，成功后才删机（防 #7 竞态；注销失败本轮放弃删机——
@@ -389,11 +395,15 @@ func (e *Engine) fireIncident(ctx context.Context, repo config.RepoEntry, a deci
 }
 
 // create：铸 token → 渲染 cloud-init → 池 Provider 建机（名字由池的 Namer
-// 取、cloud-init 落盘/清理由 Provider 负责）。返回机器名（Gate 占坑沉淀用）。
-func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs) (string, error) {
+// 取、cloud-init 落盘/清理由 Provider 负责）。extra 是本轮已建的机名——
+// 取名基于本轮观察快照，不并入会与同轮先建的机同名（GitHub 拒绝重名注册）。
+// 返回机器名（Gate 占坑沉淀用）。
+func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs, extra []string) (string, error) {
 	p := e.Cfg.ProfileOf(repo)
 	prov := e.poolFor(repo, p).Provider
-	name := prov.Namer().Next(repo.NamePrefix(), machineNames(obs.Machines))
+	names := machineNames(obs.Machines)
+	names = append(names, extra...)
+	name := prov.Namer().Next(repo.NamePrefix(), names)
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	token, err := e.GH.MintToken(ctxTO, repo.Repo)

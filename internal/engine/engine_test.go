@@ -665,6 +665,41 @@ func TestCreateUserDataIsCloudinitRenderOutput(t *testing.T) {
 	}
 }
 
+// 同一轮的多个 create 必须取名互异：取名基于本轮观察快照，第二个 create
+// 看不到第一个（2026-11-21 S1 冒烟：两台同名，GitHub 拒绝重名注册 →
+// 第二台 cloud-init 失败成僵尸，且状态按名合并使场景 B 看不见它）。
+func TestSameRoundCreatesGetDistinctNames(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.MachineAgent = config.MachineAgentCfg{Version: "v0.1.3", SHA256: strings.Repeat("a", 64)}
+	keyFile := filepath.Join(t.TempDir(), "key.pub")
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key\n"), 0o600)
+	cfg.SSHPublicKeyFiles = []string{keyFile}
+
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Jobs = []observe.Job{
+		{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)},
+		{ID: 2, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)},
+		{ID: 3, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)},
+	}
+	pool := newFakePool()
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, CloudInitRenderer{Agent: cfg.MachineAgent}, log.New(io.Discard, "", 0))
+	e.SetCollector(&fakeObs{o})
+
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], false); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Created) != 2 {
+		t.Fatalf("应建 2 台：%v", pool.Created)
+	}
+	if pool.Created[0].Name == pool.Created[1].Name {
+		t.Fatalf("同轮两台取名相同：%q", pool.Created[0].Name)
+	}
+}
+
 // 公钥文件按行读入并 trim：真实 .pub 文件带尾换行，cirunner Render 拒绝
 // 含换行的键；多行 authorized_keys 风格逐行成键，空行跳过。
 func TestPublicKeysFileLinesTrimmed(t *testing.T) {
