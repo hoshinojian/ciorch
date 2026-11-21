@@ -892,7 +892,7 @@ ciorch `daemon -dry-run` 托管 nms，与原型并跑 ≥ 24 小时，对比两�
 |---|---|---|---|---|
 | V1 | GitHub `DELETE /actions/runners/{id}` 对正在跑 job 的 runner 是否拒绝（422）？ | §3.8 Drain 的竞态防护是否成立 | 沙箱：跑 `sleep 300` 的 job 时调用删除 | |
 | V2 | vpsctl `create -image <数字快照id>` 能否建机（vpsctl 把 image 作字符串原样传给 DO） | 阶段 7 | 阶段 7 前用一个临时快照试 | |
-| V3 | ETag 304 是否计入 rate limit | 只影响轮询频率上限的估算 | 看响应头 `X-RateLimit-Remaining` 前后变化 | |
+| V3 | ETag 304 是否计入 rate limit | 只影响轮询频率上限的估算 | 看响应头 `X-RateLimit-Remaining` 前后变化 | **304 不计入**（2026-11-21 实测：同 token 先 `GET /rate_limit` 记 `core.used`，对同 URL 带 `If-None-Match` 连发 20 次全 304，再查 `used` 仅涨 1~3、3 组取最小 Δ1——涨幅与后台其他调用相当，若 304 计费应涨 ≈21）。注意：小时日志的 remaining 首尾不可用于此推导——同账号多方消费（原型/人工 gh）与整点重置会混入 |
 | V4 | DeepSeek JSON 模式的具体约束（提示词需含 "json"、是否支持 `deepseek-chat` 当前版本） | §3.10.4 | 阶段 5 前一次手工调用 | |
 | V5 | Caddy + sslip.io 能否顺利签发证书 | §3.14 | 阶段 4 部署时 | |
 | V6 | P139 式假活在 GitHub 侧的表现：online+idle 持续多久？`kill -STOP` Listener 能否复现 | 场景 A 阈值是否合理 | 沙箱 S3 | |
