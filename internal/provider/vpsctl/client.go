@@ -1,8 +1,9 @@
-// Package vpsctlapi 以子进程方式驱动 vpsctl CLI（建/列/删），解析其 JSON 输出。
-// 自 cirunner 原型迁入并按 REDESIGN §4 改造：create 不带 -wait（受理即返回）、
-// 允许公网 IP 为空（DO 异步分配）、Droplet 增补 ipv4_private 与 price_monthly。
-// vpsctl 全部库代码在 internal/ 下（Go 禁止跨仓 import），子进程是唯一依赖形态。
-package vpsctlapi
+// 本文件是 vpsctl 子进程封装（自 internal/vpsctlapi 并入——实施计划 PR ③）。
+// vpsctl 全部库代码在 vpsctl 仓 internal/ 下（Go 禁止跨仓 import），子进程是
+// 唯一依赖形态。命令契约见 REDESIGN §4：create 不带 -wait（受理即返回）、
+// 允许公网 IP 为空（DO 异步分配）、Droplet 含 ipv4_private 与 price_monthly。
+
+package vpsctl
 
 import (
 	"context"

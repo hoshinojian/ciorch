@@ -1,4 +1,6 @@
 // Package budget 是全局配额与每日预算（§3.7）：钱有硬上限，由确定性代码执行。
+// 成本口径（实施计划 §3.4）：Machine.HourlyCost 由提供商给出（vpsctl 按
+// price_monthly/672 折算），本包不再出现月价与 672 的换算。
 package budget
 
 import (
@@ -8,11 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
+	"github.com/hoshinojian/ciorch/internal/machine"
 )
-
-// dropletsPerMonth 封顶小时数（DO 月封顶 672 小时口径，§3.7）。
-const hoursPerMonth = 672.0
 
 // Request 是一个仓的建机请求（多仓争抢时按 QAge 从老到新发放）。
 type Request struct {
@@ -30,32 +29,10 @@ type Budget struct {
 	MaxDroplets    int
 	DailyBudgetUSD float64
 
-	// spentToday 累计当日已删机器的花费（活机按 droplet.CreatedAt 现算，
+	// spentToday 累计当日已删机器的花费（活机按 Machine.CreatedAt 现算，
 	// 死机要靠删除时入账，否则删得越快越"省钱"）。
 	spentToday float64
 	dayUTC     string
-}
-
-// Lister 是全局列机能力（vpsctlapi 实现）。
-type Lister interface {
-	ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error)
-}
-
-// GlobalCount 统计编排器名下全部 droplet：按配置里的账号列 -tag ciorch，
-// 同 token 多账号会同机重复——按 droplet id 去重（原型已踩过）。
-// 编排器自身机器用 tag ciorch-host，不匹配公共 tag ciorch，不计入（§3.7）。
-func (b *Budget) GlobalCount(ctx context.Context, lister Lister, accounts []string) (int, error) {
-	seen := map[string]bool{}
-	for _, acc := range accounts {
-		ds, err := lister.ListByTag(ctx, "ciorch", acc)
-		if err != nil {
-			return 0, fmt.Errorf("账号 %s 列机: %w", acc, err)
-		}
-		for _, d := range ds {
-			seen[d.ID] = true
-		}
-	}
-	return len(seen), nil
 }
 
 // Snapshot 导出当日累计（持久化用——此前只在内存，守护重启当日花费清零）。
@@ -90,15 +67,15 @@ func (b *Budget) rollover(now time.Time) {
 	}
 }
 
-// SpentToday 当日花费：活机 Σ max(0, 当日存活小时) × hourly + 已删机器入账。
-func (b *Budget) SpentToday(now time.Time, live []vpsctlapi.Droplet) float64 {
+// SpentToday 当日花费：活机 Σ max(0, 当日存活小时) × HourlyCost + 已删机器入账。
+func (b *Budget) SpentToday(now time.Time, live []machine.Machine) float64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rollover(now)
 	dayStart := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	total := b.spentToday
-	for _, d := range live {
-		from := d.CreatedAt
+	for _, m := range live {
+		from := m.CreatedAt
 		if dayStart.After(from) {
 			from = dayStart
 		}
@@ -106,25 +83,28 @@ func (b *Budget) SpentToday(now time.Time, live []vpsctlapi.Droplet) float64 {
 		if hours < 0 {
 			continue
 		}
-		total += hours * d.PriceMonthly / hoursPerMonth
+		total += hours * m.HourlyCost
 	}
 	return total
 }
 
 // RecordDeletion 删除机器时入账当日剩余时段的花费（避免"删得快=没花钱"）。
-func (b *Budget) RecordDeletion(now time.Time, d vpsctlapi.Droplet) {
+// hourly 是该机的每小时成本（提供商口径）。
+func (b *Budget) RecordDeletion(now time.Time, hourly float64, created time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rollover(now)
 	dayStart := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
-	if d.CreatedAt.Before(dayStart) {
-		d.CreatedAt = dayStart
+	if created.Before(dayStart) {
+		created = dayStart
 	}
-	b.spentToday += now.Sub(d.CreatedAt).Hours() * d.PriceMonthly / hoursPerMonth
+	b.spentToday += now.Sub(created).Hours() * hourly
 }
 
-// CanCreate 判定再建一台（价 priceMonthly）是否越线；返回false 即场景 F。
-func (b *Budget) CanCreate(now time.Time, globalCount int, live []vpsctlapi.Droplet, priceMonthly float64) (bool, string) {
+// CanCreate 判定再建一台（每小时成本 hourly）是否越线；返回 false 即场景 F。
+// 预计口径："新机至少跑 1 小时"（满 24h 投影会让示例的 $5 日预算永远建不了
+// c2 机型；真实花费由 SpentToday/RecordDeletion 入账兜底）。
+func (b *Budget) CanCreate(now time.Time, globalCount int, live []machine.Machine, hourly float64) (bool, string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rollover(now)
@@ -133,19 +113,16 @@ func (b *Budget) CanCreate(now time.Time, globalCount int, live []vpsctlapi.Drop
 	}
 	dayStart := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	total := b.spentToday
-	for _, d := range live {
-		from := d.CreatedAt
+	for _, m := range live {
+		from := m.CreatedAt
 		if dayStart.After(from) {
 			from = dayStart
 		}
 		if h := now.Sub(from).Hours(); h > 0 {
-			total += h * d.PriceMonthly / hoursPerMonth
+			total += h * m.HourlyCost
 		}
 	}
-	// 预计建一台后：以"新机至少跑 1 小时"为最小计费单位估（满 24h 投影会让
-	// §3.3 示例的 $5 日预算永远建不了 c2 机型，与配置矛盾；口径已在 PR 标注
-	// 待确认，宁可紧不可松的方向由 RecordDeletion/SpentToday 真实入账兜底）。
-	projected := total + priceMonthly/hoursPerMonth
+	projected := total + hourly
 	if projected > b.DailyBudgetUSD {
 		return false, fmt.Sprintf("预计 %.2f 超日预算 %.2f", projected, b.DailyBudgetUSD)
 	}
@@ -173,63 +150,87 @@ func Allocate(globalCount, maxDroplets int, reqs []Request) Allocation {
 
 // Gate 是全局建机闸门（复审修正 8）：把"全局配额 + 每日预算判定 + 删机入账"
 // 放进同一互斥区间——多仓并发时不会同时抢掉最后一个名额，也不会漏记账。
+// 全局列机改为对每个池 List(公共标记) 后按 (池, ID) 去重（实施计划 §3.4）。
 type Gate struct {
-	mu       sync.Mutex
-	B        *Budget
-	Lister   Lister
-	Accounts []string
+	mu sync.Mutex
+	B  *Budget
+	// Providers 是全部池（池名 → Provider）；公共标记列机按池聚合。
+	Providers map[string]machine.Provider
 	// Now 可注入时钟（测试）；默认 time.Now。
 	Now func() time.Time
-	// pending 是在途占坑（Reserve 计入、Commit 后携带 droplet 名保留到
-	// 列表可见/TTL——vpsctl list 见到新机有秒级延迟，过早释放会让别的仓
+	// pending 是在途占坑（Reserve 计入、Commit 后携带机器名保留到
+	// 列表可见/TTL——提供商列表见到新机有秒级延迟，过早释放会让别的仓
 	// 在窗口内多占一个名额）。
 	pending []gatePending
 }
 
 // NewGate 构造。
-func NewGate(b *Budget, l Lister, accounts []string) *Gate {
-	return &Gate{B: b, Lister: l, Accounts: accounts, Now: time.Now}
+func NewGate(b *Budget, providers map[string]machine.Provider) *Gate {
+	return &Gate{B: b, Providers: providers, Now: time.Now}
 }
 
-// Reservation 是一次占坑句柄：建机成功后 Commit（携带 droplet 名，占坑
-// 保留到该机器出现在全局列表里或 TTL 到期——vpsctl list 见到新机有秒级
-// 延迟，过早释放会让别的仓在窗口内多占一个名额）；失败 Abort。
+// Reservation 是一次占坑句柄：建机成功后 Commit（携带机器名，占坑
+// 保留到该机器出现在全局列表里或 TTL 到期）；失败 Abort。
 type Reservation struct {
 	id int
 }
 
 type gatePending struct {
-	name string // 建机成功后的 droplet 名（空 = 未完成）
+	name string // 建机成功后的机器名（空 = 未完成）
 	at   time.Time
 }
 
 // gateTTL 是未出现在列表里的占坑最长保留时间（保守兜底）。
 const gateTTL = 2 * time.Minute
 
-// Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口）：判定配额+预算并计入
-// 在途，建机调用方成功后 Commit、失败后 Abort。价 price=0 时用全局在册价近似。
-func (g *Gate) Reserve(ctx context.Context, price float64) (*Reservation, bool, string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	live := map[string]vpsctlapi.Droplet{}
-	for _, acc := range g.Accounts {
-		ds, err := g.Lister.ListByTag(ctx, "ciorch", acc)
+// liveMachines 对每个池按公共标记列机，按 (池, ID) 去重，返回
+// （池名排序、池内 ID 排序的）确定性列表。
+func (g *Gate) liveMachines(ctx context.Context) ([]machine.Machine, error) {
+	pools := make([]string, 0, len(g.Providers))
+	for name := range g.Providers {
+		pools = append(pools, name)
+	}
+	sort.Strings(pools)
+	live := map[string]machine.Machine{} // key = pool + "\x00" + ID
+	for _, pool := range pools {
+		ms, err := g.Providers[pool].List(ctx, "ciorch")
 		if err != nil {
-			return nil, false, fmt.Sprintf("全局列机失败（保守拒绝）: %v", err)
+			return nil, fmt.Errorf("池 %s 列机（保守拒绝）: %w", pool, err)
 		}
-		for _, d := range ds {
-			live[d.ID] = d
+		for _, m := range ms {
+			live[pool+"\x00"+m.ID] = m
 		}
 	}
-	var liveList []vpsctlapi.Droplet
-	for _, d := range live {
-		liveList = append(liveList, d)
+	keys := make([]string, 0, len(live))
+	for k := range live {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]machine.Machine, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, live[k])
+	}
+	return out, nil
+}
+
+// Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口）：判定配额+预算并计入
+// 在途，建机调用方成功后 Commit、失败后 Abort。hourly=0 时用全局在册价近似。
+func (g *Gate) Reserve(ctx context.Context, hourly float64) (*Reservation, bool, string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	liveList, err := g.liveMachines(ctx)
+	if err != nil {
+		return nil, false, err.Error()
+	}
+	liveByName := map[string]bool{}
+	for _, m := range liveList {
+		liveByName[m.Name] = true
 	}
 	// 清扫：TTL 过期的占坑释放；已命名且出现在列表里的释放（名额由 list 计）
 	kept := g.pending[:0]
 	for _, pnd := range g.pending {
 		if pnd.name != "" {
-			if _, visible := liveByName(live, pnd.name); visible {
+			if liveByName[pnd.name] {
 				continue // 已可见：释放占坑
 			}
 		}
@@ -239,11 +240,11 @@ func (g *Gate) Reserve(ctx context.Context, price float64) (*Reservation, bool, 
 		kept = append(kept, pnd)
 	}
 	g.pending = kept
-	count := len(live) + len(g.pending)
-	if price == 0 && len(liveList) > 0 {
-		price = liveList[0].PriceMonthly // 同 profile 近似价
+	count := len(liveList) + len(g.pending)
+	if hourly == 0 && len(liveList) > 0 {
+		hourly = liveList[0].HourlyCost // 同 profile 近似价
 	}
-	ok, reason := g.B.CanCreate(g.Now(), count, liveList, price)
+	ok, reason := g.B.CanCreate(g.Now(), count, liveList, hourly)
 	if !ok {
 		return nil, false, reason
 	}
@@ -251,12 +252,12 @@ func (g *Gate) Reserve(ctx context.Context, price float64) (*Reservation, bool, 
 	return &Reservation{id: len(g.pending) - 1}, true, ""
 }
 
-// Commit 建机成功：携带 droplet 名占坑保留至列表可见/TTL。
-func (g *Gate) Commit(r *Reservation, dropletName string) {
+// Commit 建机成功：携带机器名占坑保留至列表可见/TTL。
+func (g *Gate) Commit(r *Reservation, machineName string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if r != nil && r.id < len(g.pending) {
-		g.pending[r.id].name = dropletName
+		g.pending[r.id].name = machineName
 	}
 }
 
@@ -269,18 +270,9 @@ func (g *Gate) Abort(r *Reservation) {
 	}
 }
 
-func liveByName(live map[string]vpsctlapi.Droplet, name string) (vpsctlapi.Droplet, bool) {
-	for _, d := range live {
-		if d.Name == name {
-			return d, true
-		}
-	}
-	return vpsctlapi.Droplet{}, false
-}
-
-// RecordDeletion 删机入账（互斥）。
-func (g *Gate) RecordDeletion(now time.Time, price float64, created time.Time) {
+// RecordDeletion 删机入账（互斥；hourly 为提供商口径的每小时成本）。
+func (g *Gate) RecordDeletion(now time.Time, hourly float64, created time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.B.RecordDeletion(now, vpsctlapi.Droplet{PriceMonthly: price, CreatedAt: created})
+	g.B.RecordDeletion(now, hourly, created)
 }

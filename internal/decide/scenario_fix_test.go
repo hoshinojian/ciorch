@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
@@ -14,7 +15,7 @@ func TestJobStuckByJobStartedAtNotMachineBusy(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	// 机器已"忙"了 7 小时（连续接单），但当前 job 0 秒前才开始
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 7*time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, 7*time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, true)}
 	o.Jobs = []observe.Job{{
 		ID: 9, RunID: 7, Status: "in_progress", RunnerName: name,
@@ -27,7 +28,7 @@ func TestJobStuckByJobStartedAtNotMachineBusy(t *testing.T) {
 	}
 	// runner busy=true 但 jobs 里查不到对应 in_progress job → 不判 D（不退回机器级）
 	o2 := obs()
-	o2.Droplets = o.Droplets
+	o2.Machines = o.Machines
 	o2.Runners = o.Runners
 	o2.Jobs = nil
 	st2 := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-7 * time.Hour), BusySince: t0.Add(-7 * time.Hour)}}}
@@ -42,7 +43,7 @@ func TestJobStuckByJobStartedAtNotMachineBusy(t *testing.T) {
 func TestBadMachineIdempotent(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 9*time.Minute)}
+	o.Machines = []machine.Machine{droplet(name, 9*time.Minute)}
 	st := RepoState{Machines: map[string]MachineState{name: {
 		Bad: true, Remedy: "replacing", RemedyAt: t0.Add(-time.Minute),
 	}}}
@@ -89,7 +90,7 @@ func TestHalfOpenSingleProbeAcrossRounds(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		o2.Jobs = append(o2.Jobs, queuedJob(int64(i), 2*time.Minute))
 	}
-	o2.Droplets = []observe.Droplet{droplet(probe, time.Minute)}
+	o2.Machines = []machine.Machine{droplet(probe, time.Minute)}
 	acts2, st2 := Decide(params(), st1, o2)
 	if countKind(acts2, ActCreate) != 0 {
 		t.Fatalf("半开已有试探在途不应再建（复现 R4）：%v", acts2)
@@ -111,7 +112,7 @@ func TestHalfOpenSingleProbeAcrossRounds(t *testing.T) {
 func TestDrainRetryAfterFailure(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {
 		FirstOnlineAt: t0.Add(-time.Hour), IdleSince: t0.Add(-70 * time.Minute),
@@ -131,14 +132,14 @@ func TestNoReplacementWhenNoDemand(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	// B 超龄、Q=0
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 9*time.Minute)}
+	o.Machines = []machine.Machine{droplet(name, 9*time.Minute)}
 	acts, _ := Decide(params(), RepoState{}, o)
 	if countKind(acts, ActCreate) != 0 || !hasActionOn(acts, ActForceDelete, name) {
 		t.Fatalf("Q=0 的 B 应只删不建：%v", acts)
 	}
 	// C 掉线、Q=0
 	o2 := obs()
-	o2.Droplets = o.Droplets
+	o2.Machines = o.Machines
 	o2.Runners = []observe.Runner{{ID: 1, Name: name, Status: "offline"}}
 	st := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-time.Hour), OfflineSamples: 1}}}
 	acts2, _ := Decide(params(), st, o2)
@@ -157,7 +158,7 @@ func TestRemoveStaleRegistration(t *testing.T) {
 		{ID: 13, Name: "gitrunner-sgp2", Status: "offline"},            // 外部：不碰
 		{ID: 14, Name: "ci-nms-team2-ci-sgp1-08-a", Status: "offline"}, // rpd=2 残留
 	}
-	o.Droplets = []observe.Droplet{droplet("ci-nms-team2-ci-sgp1-01", time.Hour)}
+	o.Machines = []machine.Machine{droplet("ci-nms-team2-ci-sgp1-01", time.Hour)}
 	acts, _ := Decide(params(), RepoState{}, o)
 	if !hasRemoveReg(acts, "ci-nms-team2-ci-sgp1-07") || !hasRemoveReg(acts, "ci-nms-team2-ci-sgp1-08-a") {
 		t.Fatalf("应清无 droplet 的残留注册：%v", acts)
@@ -208,7 +209,7 @@ func TestDecideDoesNotMutateInput(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, 3*time.Minute)}
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{
 		Machines: map[string]MachineState{name: {
@@ -238,7 +239,7 @@ func TestDecideDoesNotMutateInput(t *testing.T) {
 func TestDrainDeregisteredNotCountedAsOffline(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, 2*time.Hour)}
 	// 无 Runners（上一轮 Drain 注销成功，删机延迟）
 	st := RepoState{Machines: map[string]MachineState{name: {
 		FirstOnlineAt: t0.Add(-2 * time.Hour), Remedy: "draining", RemedyAt: t0.Add(-2 * time.Minute),

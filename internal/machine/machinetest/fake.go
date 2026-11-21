@@ -22,9 +22,14 @@ type Fake struct {
 	byID     map[string]machine.Machine
 	failList bool
 
+	// CreateErr 非空时 Create 直接失败（退避/事故路径测试；非并发场景使用）。
+	CreateErr error
+
 	// 记录调用（断言用）
-	Created []machine.CreateRequest
-	Deleted []string
+	Created    []machine.CreateRequest
+	Deleted    []string
+	Events     []string // 动作时序（"create:<名>" / "delete:<id>"——顺序断言用）
+	ListedTags []string // List 收到的 tag 参数
 }
 
 // NewFake 构造属于池 pool 的 fake。
@@ -39,6 +44,9 @@ func (f *Fake) Kind() string { return "fake" }
 func (f *Fake) Create(ctx context.Context, req machine.CreateRequest) (machine.Machine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.CreateErr != nil {
+		return machine.Machine{}, f.CreateErr
+	}
 	f.nextID++
 	m := machine.Machine{
 		Pool: f.Pool, ID: fmt.Sprintf("fake-%s-%d", f.Pool, f.nextID),
@@ -50,6 +58,7 @@ func (f *Fake) Create(ctx context.Context, req machine.CreateRequest) (machine.M
 		Name: req.Name, Tags: append([]string(nil), req.Tags...),
 		UserData: append([]byte(nil), req.UserData...),
 	})
+	f.Events = append(f.Events, "create:"+req.Name)
 	return m, nil
 }
 
@@ -59,13 +68,29 @@ func (f *Fake) Delete(ctx context.Context, id string) error {
 	defer f.mu.Unlock()
 	delete(f.byID, id)
 	f.Deleted = append(f.Deleted, id)
+	f.Events = append(f.Events, "delete:"+id)
 	return nil
+}
+
+// Seed 预置一台机器（观察/预算测试用；Pool 由 Fake 补上）。
+func (f *Fake) Seed(m machine.Machine) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m.Pool == "" {
+		m.Pool = f.Pool
+	}
+	if m.ID == "" {
+		f.nextID++
+		m.ID = fmt.Sprintf("fake-%s-%d", f.Pool, f.nextID)
+	}
+	f.byID[m.ID] = m
 }
 
 // List 按标记精确过滤；FailNextList 注入后下一次返回 error。
 func (f *Fake) List(ctx context.Context, tag string) ([]machine.Machine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ListedTags = append(f.ListedTags, tag)
 	if f.failList {
 		f.failList = false
 		return nil, fmt.Errorf("fake: 注入的 List 失败（部分账号不可用）")

@@ -13,8 +13,9 @@ import (
 	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/machine"
+	"github.com/hoshinojian/ciorch/internal/machine/machinetest"
 	"github.com/hoshinojian/ciorch/internal/observe"
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 func testDaemon(t *testing.T) *Daemon {
@@ -28,8 +29,8 @@ func testDaemon(t *testing.T) *Daemon {
 		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
 	}
 	// 本文件只测间隔切换/触发合并/摘要，不触 IO 面——接口传 nil。
-	e := engine.New(cfg, nil, nil, nil, nil, log.New(io.Discard, "", 0))
-	return New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, nil, log.New(io.Discard, "", 0))
+	e := engine.New(cfg, nil, nil, nil, nil, nil, log.New(io.Discard, "", 0))
+	return New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 }
 
 // 间隔切换（§3.6.6）：空闲 → poll_idle；冷启在途/在忙/补救中 → poll_active。
@@ -116,13 +117,13 @@ func TestActiveWithQueue(t *testing.T) {
 // 用带记录的 fake GH/VPS/SSH 跑一轮 round()，输入含硬寿命到期的机器。
 func TestDaemonDryRunZeroWrites(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
-	o := observe.Obs{Now: time.Now(), Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: time.Now().Add(-9 * time.Hour)}}
+	o := observe.Obs{Now: time.Now(), Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Machines = []machine.Machine{{Pool: "go-heavy", ID: "d1", Name: name, CreatedAt: time.Now().Add(-9 * time.Hour), HourlyCost: 141.0 / 672.0}}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: time.Now().Add(-time.Minute)}}
 
 	gh := &recGH{}
-	vps := &recVPS{}
+	pool := machinetest.NewFake("go-heavy")
 	ssh := &recSSH{}
 	cfg := &config.Config{
 		StateDir: t.TempDir(),
@@ -132,17 +133,19 @@ func TestDaemonDryRunZeroWrites(t *testing.T) {
 		},
 		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
 	}
-	e := engine.New(cfg, gh, vps, ssh, nil, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := engine.New(cfg, gh, providers, poolOf, ssh, nil, log.New(io.Discard, "", 0))
 	e.SetCollector(&fixedObs{o})
-	d := New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, recLister{}, log.New(io.Discard, "", 0))
+	d := New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 	d.DryRun = true
 	next := d.round(context.Background(), cfg.Repos[0], filepath.Join(cfg.StateDir, "state.json"))
 	if next != d.PollActive {
 		t.Fatalf("有排队应活跃档，got %v", next)
 	}
-	if len(gh.removed)+len(vps.created)+len(vps.deleted)+len(ssh.acts) != 0 {
+	if len(gh.removed)+len(pool.Created)+len(pool.Deleted)+len(ssh.acts) != 0 {
 		t.Fatalf("dry-run 必须零写调用：removed=%v created=%v deleted=%v ssh=%v",
-			gh.removed, vps.created, vps.deleted, ssh.acts)
+			gh.removed, pool.Created, pool.Deleted, ssh.acts)
 	}
 }
 
@@ -165,32 +168,9 @@ func (f *recGH) ListRunners(ctx context.Context, repo string) ([]githubapp.Runne
 	return nil, nil
 }
 
-type recVPS struct {
-	created []vpsctlapi.CreateOpts
-	deleted []string
-}
-
-func (f *recVPS) Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error) {
-	f.created = append(f.created, o)
-	return vpsctlapi.Droplet{ID: "x", Name: "ci-nms-team2-ci-sgp1-02"}, nil
-}
-func (f *recVPS) Delete(ctx context.Context, account, id string) error {
-	f.deleted = append(f.deleted, id)
-	return nil
-}
-func (f *recVPS) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
-	return nil, nil
-}
-
 type recSSH struct{ acts []string }
 
 func (f *recSSH) Act(ctx context.Context, ip, action string) ([]byte, error) {
 	f.acts = append(f.acts, ip+":"+action)
-	return nil, nil
-}
-
-type recLister struct{}
-
-func (recLister) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
 	return nil, nil
 }
