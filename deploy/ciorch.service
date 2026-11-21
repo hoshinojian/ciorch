@@ -1,0 +1,22 @@
+# ciorch 编排器 systemd unit（REDESIGN §3.14）
+# 安装到 /etc/systemd/system/ciorch.service，二进制 /usr/local/bin/ciorch，
+# 配置 /etc/ciorch/ciorch.json，状态目录 /var/lib/ciorch（属主 ciorch）。
+[Unit]
+Description=ciorch - CI runner orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ciorch
+Group=ciorch
+ExecStart=/usr/local/bin/ciorch -config /etc/ciorch/ciorch.json daemon
+Restart=always
+RestartSec=5
+# 状态目录与凭据目录
+StateDirectory=ciorch
+# 加固：无新权限、私有 tmp
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
