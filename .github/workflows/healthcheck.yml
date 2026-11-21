@@ -1,0 +1,53 @@
+# ciorch 健康外检（REDESIGN §3.15）：GitHub 托管 runner 每小时探 /healthz，
+# 失败开 issue（复用 ciorch-down 标签的 open issue 追加评论）。
+# 公开仓托管分钟数不计费。60 天无活动 schedule 会被 GitHub 停用（runbook 有注记）。
+name: healthcheck
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 探测编排器 /healthz
+        id: probe
+        env:
+          CIORCH_HOST: ${{ vars.CIORCH_HOST }}
+        run: |
+          if [ -z "$CIORCH_HOST" ]; then
+            echo "::notice::vars.CIORCH_HOST 未配置，跳过（部署后在仓库 Settings → Secrets and variables → Actions → Variables 添加，如 203.0.113.10.sslip.io）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          if curl -fsS --max-time 20 "https://$CIORCH_HOST/healthz"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "https://$CIORCH_HOST/healthz" || echo 000)
+            echo "http=$code" >> "$GITHUB_OUTPUT"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 失败开 issue（复用 ciorch-down）
+        if: steps.probe.outputs.skip == 'false' && steps.probe.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST: ${{ vars.CIORCH_HOST }}
+          HTTP: ${{ steps.probe.outputs.http }}
+        run: |
+          ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ciorch-down --state open --json number --jq '.[0].number // empty')
+          body="健康外检失败：https://$HOST/healthz（HTTP $HTTP，$ts UTC）。编排器可能挂了或 healthz 判据过期（3×poll_idle 无完整 reconcile）。"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "[ciorch] 编排器健康外检失败（$HOST）" \
+              --label ciorch-down --body "$body"$'\n\n@'"${{ github.repository_owner }}"' 请检查编排器机器（runbook：docs/runbook.md §排障）。'
+          fi
