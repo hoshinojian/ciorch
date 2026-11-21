@@ -1,6 +1,9 @@
 # 机器提供商抽象：实施计划
 
 > 版本：2026-11-21 v1（ZCode 起草，维护者定方向）。
+> **状态：已完成（2026-11-21，PR [#16](https://github.com/hoshinojian/ciorch/pull/16)–[#23](https://github.com/hoshinojian/ciorch/pull/23)）。**
+> ZCode 审查通过（decide 零逻辑变化、golden 未动、import 边界在跑、`-race` 全绿、
+> hint>0 校验与 REDESIGN §3.3/§3.7/示例配置三处一致）；shadow 83 分钟验证完成。
 > 读者：接手实现的人/大模型。实现完交 ZCode 审查，审查口径见 §8。
 > 上位文档：[REDESIGN.md](REDESIGN.md)。本计划改动其 §2.2、§3.3、§3.5、§3.7、§3.8、§3.10.5、§4，
 > 实现时同步修改那几节（§7 列出），两份文档不得互相矛盾。
@@ -164,10 +167,11 @@ type Namer interface {
 
 - 成本：`Machine.HourlyCost` 由提供商给出。vpsctl 实现按现在的口径 `price_monthly / 672` 计算；
   `budget` 包里不再出现 672 和 `PriceMonthly`。
-- 建机前的预算投影："新机 1 小时"的成本取该池最近一台机器的 HourlyCost；池里没有机器时，
-  由提供商给一个估计值（vpsctl：按 size 查不到就保守地用池里历史最大值，没有历史就拒绝并报配置错误——
-  不能当成 0，否则 DO 池会绕过预算）。为此接口增加 `EstimateHourlyCost(ctx) (float64, error)`，
-  或者放进池配置 `hourly_cost_hint`——二选一，PR 里说明理由。
+- 建机前的预算投影："新机 1 小时"的成本取该池最近一台机器的 HourlyCost；池里没有机器时用池配置
+  `hourly_cost_hint`（**已定结论**，PR #17/#21）：vpsctl CLI 无"按 size 查价"能力，接口实现的估价只能来自
+  池内存量机器；池夜间清空是常态，"空池无估价即拒绝"会挡住每天第一台机；hint 在加载期强制 >0，
+  同样满足"预估成本不能当 0"（缺失时运行时兜底拒绝的路径保留并有测试）。空池估价经可选接口
+  `machine.CostHinter` 透出给预算层。
 - Gate（Reserve/Commit/Abort 占坑模型不变）同时检查三件事：全局 `max_machines`、**目标池**的
   `max_machines`、每日预算。计数改为对每个池 `List(公共标记)` 后按 (池, ID) 去重，不再按 account 去重。
 - 持久化的当日花费（state.json）字段名不变或做一次迁移读取，保证升级当天不清零。

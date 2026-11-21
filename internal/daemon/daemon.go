@@ -5,7 +5,10 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"time"
@@ -50,6 +53,13 @@ type Daemon struct {
 	mu        sync.Mutex
 	triggers  map[string]chan struct{}
 	lastStats map[string]engine.RoundStats // 仓 → 最近一轮 Q 等（active 判定与摘要）
+
+	// lastOK 是最近一次全仓 reconcile 成功时刻（/healthz 判据）。
+	lastOK time.Time
+	// Handler 是 HTTP 面（webhook/healthz/status）；nil = 不起 HTTP。
+	Handler http.Handler
+	// ListenAddr 是 HTTP 监听地址（只监听 127.0.0.1，公网由 Caddy 反代）。
+	ListenAddr string
 }
 
 // New 构造。
@@ -81,6 +91,28 @@ func (d *Daemon) Trigger(repo string) {
 
 // Run 主循环；ctx 取消即退出。
 func (d *Daemon) Run(ctx context.Context) error {
+	// HTTP 面（§3.11）：webhook 触发 reconcile（防抖由 Trigger 合并）、
+	// healthz/status 只读——dry-run 下同样零写入（webhook 只入缓存+触发）。
+	if d.Handler != nil && d.ListenAddr != "" {
+		srv := &http.Server{Addr: d.ListenAddr, Handler: d.Handler}
+		ln, err := net.Listen("tcp", d.ListenAddr)
+		if err != nil {
+			return fmt.Errorf("HTTP 监听 %s: %w", d.ListenAddr, err)
+		}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		go func() {
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				d.Log.Printf("HTTP 服务退出: %v", err)
+			}
+		}()
+		d.Log.Printf("HTTP 监听 %s（/webhook /healthz /status）", d.ListenAddr)
+	}
+
 	lockPath := filepath.Join(d.Cfg.StateDir, "ciorch.lock")
 	unlock, err := state.Lock(lockPath)
 	if err != nil {
@@ -160,6 +192,9 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	}
 	d.mu.Lock()
 	d.lastStats[repo.Repo] = stats
+	if obs2, oerr := d.Engine.Collector.Collect(ctx, repo, d.Cfg.ProfileOf(repo)); oerr == nil && obs2.Complete {
+		d.lastOK = now // 一轮观察完整即视为健康（healthz 判据）
+	}
 	d.mu.Unlock()
 
 	// 摘要一行（§3.9：repo=… Q=… QAge=… I=… P=… N=… actions=[…] complete=…）
