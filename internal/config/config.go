@@ -122,6 +122,7 @@ type Config struct {
 	SSHPublicKeyFiles []string           `json:"ssh_public_key_files"`
 	MachineAgent      MachineAgentCfg    `json:"machine_agent"`
 	Listen            string             `json:"listen"`
+	StatusTokenFile   string             `json:"status_token_file"` // /status 的 Bearer token 文件（§3.11）
 	StateDir          string             `json:"state_dir"`
 	Global            GlobalCfg          `json:"global"`
 	LLM               LLMCfg             `json:"llm"`
