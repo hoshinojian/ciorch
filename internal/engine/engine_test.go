@@ -63,6 +63,7 @@ type fakeGH struct {
 	removeErr   map[int64]error
 	removed     []int64
 	listRunners []githubapp.Runner
+	reruns      []int64
 }
 
 func (f *fakeGH) MintToken(ctx context.Context, repo string) (string, error) {
@@ -82,6 +83,10 @@ func (f *fakeGH) RemoveRunner(ctx context.Context, repo string, id int64) error 
 }
 func (f *fakeGH) ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error) {
 	return f.listRunners, nil
+}
+func (f *fakeGH) RerunFailedJobs(ctx context.Context, repo string, runID int64) error {
+	f.reruns = append(f.reruns, runID)
+	return nil
 }
 
 type fakeSSH struct{ acts []string }

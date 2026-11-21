@@ -83,6 +83,7 @@
         "RunnerName": "ci-nms-team2-ci-sgp1-01",
         "SSHAct": "restart-runner",
         "IncidentType": "",
+        "scenario": "A",
         "IncidentKey": "",
         "Reason": "场景 A 假活（P139）：online 不接活，先重启 Listener"
       }
@@ -294,6 +295,7 @@
         "RunnerName": "ci-nms-team2-ci-sgp1-02",
         "SSHAct": "restart-runner",
         "IncidentType": "",
+        "scenario": "A",
         "IncidentKey": "",
         "Reason": "场景 A 假活（P139）：online 不接活，先重启 Listener"
       },

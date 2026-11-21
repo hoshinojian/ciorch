@@ -53,6 +53,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "C",
         "IncidentKey": "",
         "Reason": "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）"
       },
@@ -187,6 +188,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "C",
         "IncidentKey": "",
         "Reason": "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）"
       },

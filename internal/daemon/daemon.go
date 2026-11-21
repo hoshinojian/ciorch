@@ -19,6 +19,7 @@ import (
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/engine"
+	"github.com/hoshinojian/ciorch/internal/incident"
 	"github.com/hoshinojian/ciorch/internal/state"
 )
 
@@ -31,10 +32,18 @@ const (
 // Clock 注入时间（测试）。
 type Clock func() time.Time
 
-// persisted 是 state.json 的落盘形态（决策记忆 + 当日预算累计）。
+// persisted 是 state.json 的落盘形态（决策记忆 + 当日预算累计 + 事故表 + LLM 日额）。
 type persisted struct {
-	Repos  map[string]decide.RepoState `json:"repos"`
-	Budget *budget.BudgetSnapshot      `json:"budget,omitempty"`
+	Repos     map[string]decide.RepoState `json:"repos"`
+	Budget    *budget.BudgetSnapshot      `json:"budget,omitempty"`
+	Incidents []incident.Incident         `json:"incidents,omitempty"`
+	LLMDay    *LLMDaySnapshot             `json:"llm_day,omitempty"`
+}
+
+// LLMDaySnapshot 是 LLM 每日调用计数的持久化形态。
+type LLMDaySnapshot struct {
+	DayUTC string `json:"day_utc"`
+	Count  int    `json:"count"`
 }
 
 // Daemon 是守护进程。
@@ -49,6 +58,9 @@ type Daemon struct {
 	DryRun bool
 	// Usage 返回并清零一小时用量统计（nil = 不打小时日志）。
 	Usage func() githubapp.UsageStats
+	// Incidents 是事故模块（阶段 5；nil = 未接线，仅引擎日志）。
+	// 每轮喂时间线与 Tick（诊断轮推进/安静恢复）。
+	Incidents *incident.Manager
 
 	mu        sync.Mutex
 	triggers  map[string]chan struct{}
@@ -169,6 +181,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.Budget.Restore(d.Now(), *p.Budget)
 		d.Log.Printf("恢复当日预算累计：%s 已花 %.2f USD", p.Budget.DayUTC, p.Budget.SpentToday)
 	}
+	// 事故表与 LLM 日额恢复
+	if d.Incidents != nil {
+		if len(p.Incidents) > 0 {
+			d.Incidents.Restore(p.Incidents)
+		}
+		if p.LLMDay != nil {
+			d.Incidents.RestoreLLM(p.LLMDay.DayUTC, p.LLMDay.Count)
+		}
+	}
 	// 每小时打印限流余量（shadow 观察项：24h API 健壮性）
 	go func() {
 		t := time.NewTicker(time.Hour)
@@ -233,12 +254,26 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	d.mu.Unlock()
 
 	// 摘要一行（§3.9：repo=… Q=… QAge=… I=… P=… N=… actions=[…] complete=…）
-	d.Log.Printf("[%s] Q=%d QAge=%v I=%d P=%d N=%d actions=[%s] complete=%v",
-		repo.Repo, stats.Q, stats.QAge, stats.I, stats.P, stats.N, kindsOf(acts), stats.Complete)
+	summary := fmt.Sprintf("Q=%d QAge=%v I=%d P=%d N=%d actions=[%s] complete=%v",
+		stats.Q, stats.QAge, stats.I, stats.P, stats.N, kindsOf(acts), stats.Complete)
+	d.Log.Printf("[%s] %s", repo.Repo, summary)
 
-	// 原子写状态（锁内深拷贝快照 + 当日预算累计）
+	// 事故模块：喂时间线 + 推进诊断轮/安静恢复（§3.10.1）
+	if d.Incidents != nil {
+		d.Incidents.Note(repo.Repo, "observe", summary)
+		d.Incidents.Tick(ctx, repo.Repo)
+	}
+
+	// 原子写状态（锁内深拷贝快照 + 当日预算累计 + 事故表 + LLM 日额）
 	snap := d.Budget.Snapshot(d.Now())
-	if err := state.Save(statePath, persisted{Repos: d.Engine.StatesSnapshot(), Budget: &snap}); err != nil {
+	p := persisted{Repos: d.Engine.StatesSnapshot(), Budget: &snap}
+	if d.Incidents != nil {
+		p.Incidents = d.Incidents.Snapshot()
+		if day, n := d.Incidents.LLMUsage(); day != "" {
+			p.LLMDay = &LLMDaySnapshot{DayUTC: day, Count: n}
+		}
+	}
+	if err := state.Save(statePath, p); err != nil {
 		d.Log.Printf("[%s] 状态持久化失败: %v", repo.Repo, err)
 	}
 	return d.nextInterval(repo, now)
