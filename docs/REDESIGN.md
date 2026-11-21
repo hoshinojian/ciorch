@@ -790,6 +790,11 @@ health 的全部内容，外加各段文本（每段截取末尾 `--lines` 行�
 
 输出 `{"action": "...", "ok": true, "detail": "..."}`。未知 name → 退出码 2。
 
+> 实现注意（V6 实测坑，2026-11-21）：`pgrep -f Runner.Listener` 会匹配到含该
+> 模式串的**自身命令行**（如经 ssh 执行 `bash -c 'kill -STOP $(pgrep -f Runner.Listener)'`
+> 时会把 STOP 打到会话 bash 上，致 ssh 断连）。机器侧代码用 `pgrep -x`（精确
+> 进程名）或 `[R]unner.Listener` 字符集写法避开自匹配。
+
 ### 5.5 快照烘焙（阶段 7，依赖 vpsctl 扩展，见 §9）
 
 - 配方 `pkg/cloudinit` 的 bake 模式：做 §5.3 的全部安装步骤，但**不注册 runner**；额外预取：`docker pull` profile 配置的镜像列表（nms：`timescale/timescaledb:2.17.2-pg16`）、预装 profile 配置的工具（nms：Go 工具链按 go.mod 版本、golangci-lint v2.13.2、gitleaks 8.30.1、sqlc 1.31.1）；完成后 `touch /var/lib/cirunner/baked`、`cloud-init clean --logs`，然后关机。
