@@ -1,0 +1,56 @@
+{
+  "github_app": {
+    "app_id": 123456,
+    "private_key_file": "/etc/ciorch/app.pem",
+    "webhook_secret_file": "/etc/ciorch/webhook.secret"
+  },
+  "pools": {
+    "do-sgp1-c2": {
+      "provider": "vpsctl",
+      "max_machines": 2,
+      "vpsctl": {
+        "bin": "/usr/local/bin/vpsctl",
+        "accounts_file": "/etc/ciorch/vpsctl-accounts.json",
+        "account": "<ci-dedicated-account>",
+        "region": "sgp1",
+        "size": "c2-4vcpu-8gb",
+        "image": "ubuntu-24-04-x64",
+        "snapshot": "",
+        "prefer_private_ip": true,
+        "hourly_cost_hint": 0.21
+      }
+    }
+  },
+  "ssh_private_key_file": "/etc/ciorch/ssh/id_ed25519",
+  "ssh_public_key_files": ["/etc/ciorch/ssh/id_ed25519.pub", "/etc/ciorch/maintainer.pub"],
+  "machine_agent": { "version": "v0.1.0", "sha256": "<release-asset-sha256>" },
+  "listen": "127.0.0.1:8080",
+  "state_dir": "/var/lib/ciorch",
+  "global": {
+    "max_machines": 2,
+    "daily_budget_usd": 5.0
+  },
+  "llm": {
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "api_key_file": "/etc/ciorch/deepseek.key",
+    "max_calls_per_incident": 3,
+    "max_calls_per_day": 20
+  },
+  "maintainer_login": "<maintainer-login>",
+  "profiles": {
+    "go-heavy": {
+      "pools": ["do-sgp1-c2"],
+      "labels": ["ci"],
+      "runners_per_droplet": 1
+    }
+  },
+  "repos": [
+    {
+      "repo": "<owner>/<name>",
+      "profile": "go-heavy",
+      "max_runners": 2,
+      "issue_repo": ""
+    }
+  ]
+}

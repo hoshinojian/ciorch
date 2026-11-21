@@ -26,7 +26,7 @@ type Allocation map[string]int
 // Budget 维护全局配额与当日（UTC）花费。
 type Budget struct {
 	mu             sync.Mutex
-	MaxDroplets    int
+	MaxMachines    int
 	DailyBudgetUSD float64
 
 	// spentToday 累计当日已删机器的花费（活机按 Machine.CreatedAt 现算，
@@ -108,8 +108,8 @@ func (b *Budget) CanCreate(now time.Time, globalCount int, live []machine.Machin
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.rollover(now)
-	if globalCount >= b.MaxDroplets {
-		return false, fmt.Sprintf("全局配额已满（%d/%d）", globalCount, b.MaxDroplets)
+	if globalCount >= b.MaxMachines {
+		return false, fmt.Sprintf("全局配额已满（%d/%d）", globalCount, b.MaxMachines)
 	}
 	dayStart := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	total := b.spentToday
@@ -156,17 +156,21 @@ type Gate struct {
 	B  *Budget
 	// Providers 是全部池（池名 → Provider）；公共标记列机按池聚合。
 	Providers map[string]machine.Provider
+	// PoolCaps 是各池容量上限（pools.<名>.max_machines）。
+	PoolCaps map[string]int
+	// Hints 是各池空池估价（USD/h；池里有机器时不用）。
+	Hints map[string]float64
 	// Now 可注入时钟（测试）；默认 time.Now。
 	Now func() time.Time
 	// pending 是在途占坑（Reserve 计入、Commit 后携带机器名保留到
 	// 列表可见/TTL——提供商列表见到新机有秒级延迟，过早释放会让别的仓
-	// 在窗口内多占一个名额）。
+	// 在窗口内多占一个名额）。占坑带池名：池容量同样防超发。
 	pending []gatePending
 }
 
 // NewGate 构造。
-func NewGate(b *Budget, providers map[string]machine.Provider) *Gate {
-	return &Gate{B: b, Providers: providers, Now: time.Now}
+func NewGate(b *Budget, providers map[string]machine.Provider, poolCaps map[string]int, hints map[string]float64) *Gate {
+	return &Gate{B: b, Providers: providers, PoolCaps: poolCaps, Hints: hints, Now: time.Now}
 }
 
 // Reservation 是一次占坑句柄：建机成功后 Commit（携带机器名，占坑
@@ -176,6 +180,7 @@ type Reservation struct {
 }
 
 type gatePending struct {
+	pool string // 目标池（池容量同样计入在途）
 	name string // 建机成功后的机器名（空 = 未完成）
 	at   time.Time
 }
@@ -213,20 +218,38 @@ func (g *Gate) liveMachines(ctx context.Context) ([]machine.Machine, error) {
 	return out, nil
 }
 
-// Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口）：判定配额+预算并计入
-// 在途，建机调用方成功后 Commit、失败后 Abort。hourly=0 时用全局在册价近似。
-func (g *Gate) Reserve(ctx context.Context, hourly float64) (*Reservation, bool, string) {
+// Reserve 互斥占坑（复审修正 8 的 TOCTOU 收口 + §3.4 按池）：一次判定三件事
+// ——全局 max_machines、目标池 max_machines、每日预算——并计入在途；建机
+// 调用方成功后 Commit、失败后 Abort。预算投影价取目标池最近一台机器的
+// HourlyCost；空池用配置 hint；两者皆无则拒绝（不能当 0，防绕过预算）。
+func (g *Gate) Reserve(ctx context.Context, pool string) (*Reservation, bool, string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if _, ok := g.Providers[pool]; !ok {
+		return nil, false, fmt.Sprintf("未知池 %q", pool)
+	}
+	cap, hasCap := g.PoolCaps[pool]
+	if !hasCap {
+		return nil, false, fmt.Sprintf("池 %s 未配置容量（max_machines）", pool)
+	}
 	liveList, err := g.liveMachines(ctx)
 	if err != nil {
 		return nil, false, err.Error()
 	}
 	liveByName := map[string]bool{}
+	liveInPool := 0
+	newest := machine.Machine{}
 	for _, m := range liveList {
 		liveByName[m.Name] = true
+		if m.Pool == pool {
+			liveInPool++
+			if m.CreatedAt.After(newest.CreatedAt) {
+				newest = m
+			}
+		}
 	}
 	// 清扫：TTL 过期的占坑释放；已命名且出现在列表里的释放（名额由 list 计）
+	pendingAll, pendingPool := 0, 0
 	kept := g.pending[:0]
 	for _, pnd := range g.pending {
 		if pnd.name != "" {
@@ -238,17 +261,33 @@ func (g *Gate) Reserve(ctx context.Context, hourly float64) (*Reservation, bool,
 			continue // TTL 兜底释放
 		}
 		kept = append(kept, pnd)
+		pendingAll++
+		if pnd.pool == pool {
+			pendingPool++
+		}
 	}
 	g.pending = kept
-	count := len(liveList) + len(g.pending)
-	if hourly == 0 && len(liveList) > 0 {
-		hourly = liveList[0].HourlyCost // 同 profile 近似价
+	if global := len(liveList) + pendingAll; global >= g.B.MaxMachines {
+		return nil, false, fmt.Sprintf("全局配额已满（%d/%d）", global, g.B.MaxMachines)
 	}
-	ok, reason := g.B.CanCreate(g.Now(), count, liveList, hourly)
-	if !ok {
+	if n := liveInPool + pendingPool; n >= cap {
+		return nil, false, fmt.Sprintf("池 %s 容量已满（%d/%d）", pool, n, cap)
+	}
+	hourly := 0.0
+	switch {
+	case liveInPool > 0:
+		hourly = newest.HourlyCost // 该池最近一台机器的时价（§3.4）
+	default:
+		hint, ok := g.Hints[pool]
+		if !ok || hint <= 0 {
+			return nil, false, fmt.Sprintf("池 %s 空池且无估价依据（hourly_cost_hint 缺失），拒绝建机（不能当 0）", pool)
+		}
+		hourly = hint
+	}
+	if ok, reason := g.B.CanCreate(g.Now(), len(liveList)+pendingAll, liveList, hourly); !ok {
 		return nil, false, reason
 	}
-	g.pending = append(g.pending, gatePending{at: g.Now()})
+	g.pending = append(g.pending, gatePending{pool: pool, at: g.Now()})
 	return &Reservation{id: len(g.pending) - 1}, true, ""
 }
 

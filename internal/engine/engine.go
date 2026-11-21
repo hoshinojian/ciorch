@@ -123,7 +123,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	}
 	p := e.Cfg.ProfileOf(repo)
 	pool := e.PoolOf(repo, p)
-	if pool == nil {
+	if pool.Provider == nil {
 		return nil, RoundStats{}, fmt.Errorf("仓 %s 的池未装配（PoolOf 未注入或池缺失）", repo.Repo)
 	}
 	obs, err := e.Collector.Collect(ctx, repo, p)
@@ -134,7 +134,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 		MaxRunners:        repo.MaxRunners,
 		RunnersPerDroplet: p.RunnersPerDroplet,
 		// 命名空间由池的 Namer 给出（vpsctl：{prefix}-{account}-{region}-NN）
-		OwnedRunnerRe: regexp.MustCompile(pool.Namer().Pattern(repo.NamePrefix())),
+		OwnedRunnerRe: regexp.MustCompile(pool.Provider.Namer().Pattern(repo.NamePrefix())),
 	}
 	e.mu.Lock()
 	state := e.States[repo.Repo]
@@ -159,7 +159,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs, params decide.Params) RoundStats {
 	p := e.Cfg.ProfileOf(repo)
 	st := RoundStats{N: len(obs.Machines), Complete: obs.Complete}
-	re := regexp.MustCompile(e.PoolOf(repo, p).Namer().Pattern(repo.NamePrefix()))
+	re := regexp.MustCompile(e.PoolOf(repo, p).Provider.Namer().Pattern(repo.NamePrefix()))
 	for _, j := range obs.Jobs {
 		if j.Status == "queued" {
 			st.Q++
@@ -222,7 +222,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 			// 全局配额+预算占坑（复审修正 8：Reserve→建机→Commit/Abort，
 			// 判定与建机之间的间隙不会让两仓抢掉同一个名额）
 			if e.Gate != nil {
-				res, ok, reason := e.Gate.Reserve(ctx, liveHourlyCost(obs))
+				res, ok, reason := e.Gate.Reserve(ctx, e.PoolOf(repo, e.Cfg.ProfileOf(repo)).Name)
 				if !ok {
 					qAge := queueAge(obs)
 					e.Log.Printf("[%s] 跳过建机（场景 F）：%s", repo.Repo, reason)
@@ -349,7 +349,7 @@ func (e *Engine) fireIncident(ctx context.Context, repo config.RepoEntry, a deci
 // 取、cloud-init 落盘/清理由 Provider 负责）。返回机器名（Gate 占坑沉淀用）。
 func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs) (string, error) {
 	p := e.Cfg.ProfileOf(repo)
-	prov := e.PoolOf(repo, p)
+	prov := e.PoolOf(repo, p).Provider
 	name := prov.Namer().Next(repo.NamePrefix(), machineNames(obs.Machines))
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -463,15 +463,6 @@ func (e *Engine) recordDeletion(obs observe.Obs, machineID string) {
 			return
 		}
 	}
-}
-
-// liveHourlyCost 取本仓现存机器每小时成本作新机近似价（同 profile；
-// 无机器=0，Gate 侧用全局任一在册价兜底）。
-func liveHourlyCost(obs observe.Obs) float64 {
-	for _, m := range obs.Machines {
-		return m.HourlyCost
-	}
-	return 0
 }
 
 func machineAddr(obs observe.Obs, name string) string {

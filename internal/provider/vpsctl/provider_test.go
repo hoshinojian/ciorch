@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/machine/machinetest"
 )
@@ -110,7 +109,7 @@ func newTestProvider(t *testing.T) (*Provider, *fakeBin, string) {
 	p := NewProvider("test-pool", Options{
 		Bin: "/usr/bin/fake-vpsctl", AccountsFile: "/tmp/vpsctl-accounts.json",
 		Account: "team2-ci", Region: "sgp1", Size: "c2-4vcpu-8gb", Image: "ubuntu-24-04-x64",
-		PreferPrivateIP: true,
+		PreferPrivateIP: &[]bool{true}[0],
 	}, dir)
 	p.client.Run = bin.run
 	return p, bin, dir
@@ -152,12 +151,8 @@ func TestNamerByteIdenticalWithLegacy(t *testing.T) {
 		// 交叉对照旧 decide.NextName 的活体比对已在 PR ②（#18，两实现并存期）
 		// 完成并留档；decide.NextName 随 PR ③ 删除，此处由字面期望值锁行为。
 	}
-	// Pattern 与旧 config.NamespacePattern 逐字节一致（删除旧实现时移除本段）
-	re := config.RepoEntry{Repo: "hoshinojian/nms"}
-	prof := config.Profile{Account: "team2-ci", Region: "sgp1"}
-	if got, legacy := n.Pattern(re.NamePrefix()), re.NamespacePattern(prof); got != legacy {
-		t.Errorf("Pattern 与旧 NamespacePattern 不一致：new=%q legacy=%q", got, legacy)
-	}
+	// 与旧 config.NamespacePattern 的活体比对已在 PR ②（#18）完成并留档；
+	// NamespacePattern 随 PR ④ 池化配置删除，此处由字面值锁行为。
 	if want := `^ci-nms-team2-ci-sgp1-\d{2}$`; n.Pattern("ci-nms") != want {
 		t.Errorf("Pattern 字面值：%q want %q", n.Pattern("ci-nms"), want)
 	}
@@ -284,5 +279,90 @@ func TestListPartialFailureRealPath(t *testing.T) {
 	bin.mu.Unlock()
 	if ms, err := p.List(context.Background(), "ciorch"); err == nil {
 		t.Fatalf("errors[] 非空必须报错，不得返回半截列表：%+v", ms)
+	}
+}
+
+// ---------- Factory（池配置 "vpsctl" 子对象解析与校验，§3.3/§3.4） ----------
+
+func factoryOpts() map[string]any {
+	return map[string]any{
+		"bin": "/usr/bin/vpsctl", "accounts_file": "/tmp/a.json",
+		"account": "team2-ci", "region": "sgp1", "size": "c2-4vcpu-8gb",
+		"image": "ubuntu-24-04-x64", "hourly_cost_hint": 0.21,
+	}
+}
+
+func mustJSON(t *testing.T, m map[string]any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// 合法配置可构造；缺字段/坏值/未知字段报错（错误信息带字段路径）。
+func TestFactoryValidation(t *testing.T) {
+	env := machine.Env{StateDir: t.TempDir()}
+	if _, err := Factory("do-pool", mustJSON(t, factoryOpts()), env); err != nil {
+		t.Fatalf("合法配置应通过：%v", err)
+	}
+	for key, bad := range map[string]any{
+		"bin": "", "account": "", "region": "", "size": "", "image": "",
+	} {
+		m := factoryOpts()
+		m[key] = bad
+		if _, err := Factory("do-pool", mustJSON(t, m), env); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s 缺失应报错且带字段名：%v", key, err)
+		}
+	}
+	// region slug 形式
+	m := factoryOpts()
+	m["region"] = "Singapore-1"
+	if _, err := Factory("do-pool", mustJSON(t, m), env); err == nil || !strings.Contains(err.Error(), "region slug") {
+		t.Errorf("坏 region 应报错：%v", err)
+	}
+	// hourly_cost_hint ≤0 拒绝（不能当 0）
+	m = factoryOpts()
+	m["hourly_cost_hint"] = 0
+	if _, err := Factory("do-pool", mustJSON(t, m), env); err == nil || !strings.Contains(err.Error(), "hourly_cost_hint") {
+		t.Errorf("hint=0 应报错（防绕过预算）：%v", err)
+	}
+	// 未知字段拒绝（DisallowUnknownFields）
+	m = factoryOpts()
+	m["tpyo_field"] = 1
+	if _, err := Factory("do-pool", mustJSON(t, m), env); err == nil {
+		t.Error("拼错字段应整体拒绝")
+	}
+	// state_dir 缺失
+	if _, err := Factory("do-pool", mustJSON(t, factoryOpts()), machine.Env{}); err == nil || !strings.Contains(err.Error(), "state_dir") {
+		t.Errorf("state_dir 缺失应报错：%v", err)
+	}
+}
+
+// 构造出的 Provider：CostHinter 透出 hint；prefer_private_ip 缺省= true。
+func TestFactoryDefaults(t *testing.T) {
+	env := machine.Env{StateDir: t.TempDir()}
+	p, err := Factory("do-pool", mustJSON(t, factoryOpts()), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vp := p.(*Provider)
+	if got := vp.HourlyCostHint(); got != 0.21 {
+		t.Fatalf("HourlyCostHint：%v", got)
+	}
+	if !vp.opt.preferPrivateIP() {
+		t.Fatal("prefer_private_ip 缺省应为 true（现行行为：私网优先）")
+	}
+	// snapshot 非空时建机用它替代 image
+	vp.opt.Snapshot = "snapshot-12345"
+	if got := vp.opt.buildImage(); got != "snapshot-12345" {
+		t.Fatalf("snapshot 应优先：%q", got)
+	}
+	// 显式 false 用公网
+	f := false
+	vp.opt.PreferPrivateIP = &f
+	if vp.opt.preferPrivateIP() {
+		t.Fatal("显式 false 应关掉私网优先")
 	}
 }

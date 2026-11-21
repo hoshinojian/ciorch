@@ -5,7 +5,9 @@
 package vpsctl
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,20 +19,38 @@ import (
 	"github.com/hoshinojian/ciorch/internal/machine"
 )
 
+// regionRe：DO region slug 形如 sgp1/nyc3/blr1（无连字符）。
+var regionRe = regexp.MustCompile(`^[a-z]+[0-9]+$`)
+
 // hoursPerMonth 是 DO 月封顶小时数口径（REDESIGN §3.7）：
 // Machine.HourlyCost = price_monthly / 672。
 const hoursPerMonth = 672.0
 
-// Options 是 vpsctl 池的建机参数（实施计划 PR ④ 起由池配置的 "vpsctl"
-// 子对象解析；本 PR 由调用方直接构造）。
+// Options 是 vpsctl 池的建机参数（池配置的 "vpsctl" 子对象，§3.3）。
 type Options struct {
-	Bin             string
-	AccountsFile    string // 可选 -accounts（CI 专用账号文件，REDESIGN §2.3）
-	Account         string // vpsctl -only 钉账号（防全账号误建，2026-11-13 教训）
-	Region          string
-	Size            string
-	Image           string
-	PreferPrivateIP bool // Machine.Addr 优先私网（同区同 VPC 内网直连）
+	Bin          string `json:"bin"`
+	AccountsFile string `json:"accounts_file"` // 可选 -accounts（CI 专用账号文件，REDESIGN §2.3）
+	Account      string `json:"account"`       // vpsctl -only 钉账号（防全账号误建，2026-11-13 教训）
+	Region       string `json:"region"`
+	Size         string `json:"size"`
+	Image        string `json:"image"`
+	Snapshot     string `json:"snapshot"` // 阶段 7 快照；非空时建机用它替代 Image
+	// PreferPrivateIP 为 nil 或 true 时 Machine.Addr 优先私网（同区同 VPC
+	// 内网直连）；显式 false 用公网。
+	PreferPrivateIP *bool   `json:"prefer_private_ip"`
+	HourlyCostHint  float64 `json:"hourly_cost_hint"` // 空池建新机的保守估价（USD/h，必填>0）
+}
+
+func (o Options) preferPrivateIP() bool {
+	return o.PreferPrivateIP == nil || *o.PreferPrivateIP
+}
+
+// buildImage 返回建机实际用的镜像（快照优先，§3.3 snapshot）。
+func (o Options) buildImage() string {
+	if o.Snapshot != "" {
+		return o.Snapshot
+	}
+	return o.Image
 }
 
 // Provider 实现一个 vpsctl 池（account+region+size+image 组合）。
@@ -44,6 +64,39 @@ type Provider struct {
 
 	failList atomic.Bool // 测试钩子：契约套件的失败注入（生产路径不设置）
 }
+
+// Factory 解析池配置的 "vpsctl" 子对象并构造 Provider（config.Load 启动期
+// 也会调用一次做校验）。注册名 "vpsctl"。
+func Factory(pool string, raw json.RawMessage, env machine.Env) (machine.Provider, error) {
+	var o Options
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&o); err != nil {
+		return nil, fmt.Errorf("pools.%s.vpsctl: %w", pool, err)
+	}
+	for _, c := range []struct {
+		key, val string
+	}{
+		{"bin", o.Bin}, {"account", o.Account}, {"region", o.Region},
+		{"size", o.Size}, {"image", o.Image},
+	} {
+		if c.val == "" {
+			return nil, fmt.Errorf("pools.%s.vpsctl.%s：必填", pool, c.key)
+		}
+	}
+	if !regionRe.MatchString(o.Region) {
+		return nil, fmt.Errorf("pools.%s.vpsctl.region：%q 不是 DO region slug 形式", pool, o.Region)
+	}
+	if o.HourlyCostHint <= 0 {
+		return nil, fmt.Errorf("pools.%s.vpsctl.hourly_cost_hint：必须 >0（空池建机的预算投影不能当 0，否则 DO 池会绕过预算）", pool)
+	}
+	if env.StateDir == "" {
+		return nil, fmt.Errorf("pools.%s：缺少 state_dir（cloud-init 落盘目录的根）", pool)
+	}
+	return NewProvider(pool, o, filepath.Join(env.StateDir, "cloudinit")), nil
+}
+
+func init() { machine.Register("vpsctl", Factory) }
 
 // NewProvider 构造。userDataDir 是 cloud-init 文件目录（内容含 1h 时效
 // registration token：0600 落盘、建机成功即删）。
@@ -94,7 +147,7 @@ func (p *Provider) Create(ctx context.Context, req machine.CreateRequest) (machi
 		return machine.Machine{}, fmt.Errorf("写 cloud-init: %w", err)
 	}
 	d, err := p.client.Create(ctx, CreateOpts{
-		Account: p.opt.Account, Region: p.opt.Region, Size: p.opt.Size, Image: p.opt.Image,
+		Account: p.opt.Account, Region: p.opt.Region, Size: p.opt.Size, Image: p.opt.buildImage(),
 		NamePrefix: prefix, StartIndex: start,
 		Tags: req.Tags, UserDataFile: path,
 	})
@@ -136,11 +189,14 @@ func (p *Provider) Namer() machine.Namer { return p.nam }
 // 生产路径不调用）。
 func (p *Provider) FailNextList() { p.failList.Store(true) }
 
+// HourlyCostHint 实现 machine.CostHinter（空池估价透出给预算层）。
+func (p *Provider) HourlyCostHint() float64 { return p.opt.HourlyCostHint }
+
 // toMachine 把 vpsctl 视图折成提供商无关视图。Addr：私网优先（可配），
 // 缺私网用公网，都缺为空（engine 侧跳过 ssh）。
 func (p *Provider) toMachine(d Droplet) machine.Machine {
 	addr := d.IPv4Public
-	if p.opt.PreferPrivateIP && d.IPv4Private != "" {
+	if p.opt.preferPrivateIP() && d.IPv4Private != "" {
 		addr = d.IPv4Private
 	}
 	return machine.Machine{
