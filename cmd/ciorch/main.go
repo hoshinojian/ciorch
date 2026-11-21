@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,8 +21,11 @@ import (
 	"github.com/hoshinojian/ciorch/internal/budget"
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/daemon"
+	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/incident"
+	"github.com/hoshinojian/ciorch/internal/llm"
 	"github.com/hoshinojian/ciorch/internal/machine"
 	// 装配层负责注册提供商实现（Registry 经 init 注册；不 import 则不注册）
 	"github.com/hoshinojian/ciorch/internal/observe"
@@ -127,6 +133,109 @@ type runtime struct {
 	poolCaps  map[string]int
 	hints     map[string]float64
 	poolOf    observe.PoolOf
+	incidents *incident.Manager
+}
+
+// incidentEvidence 是 incident.EvidenceSource 的装配实现：观察快照/决策状态
+// 取自 engine，机器诊断走 ssh，日志与重跑判定走 githubapp（全部确定性代码）。
+type incidentEvidence struct {
+	eng *engine.Engine
+	ssh sshx
+	gh  rerunFace
+	cfg *config.Config
+}
+
+// rerunFace 是证据需要的 GitHub 能力（*githubapp.Client 实现）。
+type rerunFace interface {
+	GetJobLog(ctx context.Context, repo string, jobID int64) ([]byte, error)
+	ListRuns(ctx context.Context, repo string, since time.Time) ([]githubapp.Run, error)
+	ListJobs(ctx context.Context, repo string, runID int64) ([]githubapp.Job, error)
+}
+
+func (e incidentEvidence) Obs(repo string) (observe.Obs, bool) {
+	obs := e.eng.LastObsOf(repo)
+	return obs, !obs.Now.IsZero()
+}
+
+func (e incidentEvidence) RepoState(repo string) decide.RepoState {
+	return e.eng.StatesSnapshot()[repo]
+}
+
+func (e incidentEvidence) MachineDiag(ctx context.Context, repo, machineName string) json.RawMessage {
+	obs := e.eng.LastObsOf(repo)
+	addr := ""
+	for _, m := range obs.Machines {
+		if m.Name == machineName {
+			addr = m.Addr
+			break
+		}
+	}
+	if addr == "" {
+		return json.RawMessage(`{"error":"机器不在观察快照里"}`)
+	}
+	out, err := e.ssh.Diag(ctx, addr)
+	if err != nil {
+		return json.RawMessage(`{"error":` + strconv.Quote(err.Error()) + `}`)
+	}
+	return json.RawMessage(out)
+}
+
+func (e incidentEvidence) JobLogTail(ctx context.Context, repo string, jobID int64) string {
+	raw, err := e.gh.GetJobLog(ctx, repo, jobID)
+	if err != nil {
+		return ""
+	}
+	const max = 32 << 10
+	if len(raw) > max {
+		raw = raw[len(raw)-max:]
+	}
+	return string(raw)
+}
+
+// rerunFeatures 是 rerun_failed_jobs 的日志特征（§3.10.5）。
+var rerunFeatures = []string{"lost communication", "shutdown signal", "The operation was canceled"}
+
+func (e incidentEvidence) RerunnableRuns(ctx context.Context, repo string) map[int64]bool {
+	out := map[int64]bool{}
+	runs, err := e.gh.ListRuns(ctx, repo, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		return out
+	}
+	checked := 0
+	for _, r := range runs {
+		if checked >= 5 { // 证据采集的确定性上限（日志拉取较贵）
+			break
+		}
+		if r.Status != "completed" {
+			continue // 只看已完结 run；是否失败由 job conclusion 判断
+		}
+		jobs, err := e.gh.ListJobs(ctx, repo, r.ID)
+		if err != nil {
+			continue
+		}
+		for _, j := range jobs {
+			if j.Conclusion != "failure" {
+				continue
+			}
+			checked++
+			raw, err := e.gh.GetJobLog(ctx, repo, j.ID)
+			if err != nil {
+				continue
+			}
+			tail := string(raw)
+			if len(tail) > 64<<10 {
+				tail = tail[len(tail)-64<<10:]
+			}
+			for _, f := range rerunFeatures {
+				if strings.Contains(tail, f) {
+					out[r.ID] = true
+					break
+				}
+			}
+			break // 每 run 只查首个失败 job
+		}
+	}
+	return out
 }
 
 // wiring 组装真实客户端与执行面：按配置的 pools 从 Registry 构造各池
@@ -175,7 +284,59 @@ func wiring(cfg *config.Config, token string) (*runtime, error) {
 	rt.collector = &observe.Collector{GH: rt.gh, PoolOf: rt.poolOf, Cache: observe.NewJobCache()}
 	rt.engine = engine.New(cfg, rt.gh, rt.providers, rt.poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, engine.CloudInitRenderer{Agent: cfg.MachineAgent}, log.Default())
 	rt.engine.SetCollector(rt.collector)
+	rt.incidents = wireIncidents(cfg, rt)
 	return rt, nil
+}
+
+// wireIncidents 构造事故模块（§3.10）：issue API + LLM（key 未配置则诊断禁用，
+// 事故照常开 issue/安静恢复）+ 执行面 + 证据源；接 engine 的 OnIncident/OnRemedy。
+func wireIncidents(cfg *config.Config, rt *runtime) *incident.Manager {
+	mgr := incident.New(rt.gh, rt.engine, incident.Options{
+		MaintainerLogin: cfg.MaintainerLogin,
+		IssueRepoOf: func(repo string) string {
+			for _, r := range cfg.Repos {
+				if r.Repo == repo {
+					return r.IssueRepo
+				}
+			}
+			return ""
+		},
+		PoolsOf: func(repo string) []string {
+			for _, r := range cfg.Repos {
+				if r.Repo == repo {
+					return cfg.Profiles[r.Profile].Pools
+				}
+			}
+			return nil
+		},
+	}, cfg.StateDir, log.Default())
+	if cfg.LLM.APIKeyFile != "" {
+		if raw, err := os.ReadFile(cfg.LLM.APIKeyFile); err == nil {
+			key := string(bytes.TrimSpace(raw))
+			if len(key) > 0 {
+				base, model := cfg.LLM.BaseURL, cfg.LLM.Model
+				if base == "" {
+					base = "https://api.deepseek.com"
+				}
+				if model == "" {
+					model = "deepseek-chat"
+				}
+				mgr.LLM = &llm.Client{BaseURL: base, Model: model, APIKey: key}
+			}
+		} else {
+			log.Printf("[incident] llm.api_key_file 读取失败——诊断禁用（事故照常开 issue）: %v", err)
+		}
+	}
+	mgr.Evidence = incidentEvidence{eng: rt.engine, ssh: sshx{keyFile: cfg.SSHPrivateKeyFile}, gh: rt.gh, cfg: cfg}
+	rt.engine.OnIncident = func(ctx context.Context, repo string, a decide.Action) {
+		if err := mgr.Handle(ctx, repo, a); err != nil {
+			log.Printf("[incident][%s] 处理失败: %v", repo, err)
+		}
+	}
+	rt.engine.OnRemedy = func(ctx context.Context, repo, scenario, subject, detail string) {
+		mgr.NoteRemedy(repo, scenario, subject, detail)
+	}
+	return mgr
 }
 
 func reposOf(cfg *config.Config, repoFilter string) []config.RepoEntry {
@@ -277,7 +438,8 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	b := &budget.Budget{MaxMachines: cfg.Global.MaxMachines, DailyBudgetUSD: cfg.Global.DailyBudgetUSD}
 	rt.engine.Gate = budget.NewGate(b, rt.providers, rt.poolCaps, rt.hints) // 全局+池容量+预算互斥闸门
 	d := daemon.New(cfg, rt.engine, b, log.Default())
-	d.Usage = rt.gh.SwapUsage // 每小时用量日志：requests/304/Remaining 首尾（V3 推法）
+	d.Usage = rt.gh.SwapUsage  // 每小时用量日志：requests/304/Remaining 首尾（V3 推法）
+	d.Incidents = rt.incidents // 每轮喂时间线 + Tick（诊断轮/安静恢复）
 	// HTTP 面（§3.11）：webhook secret 文件配置了才起；dry-run 下同样
 	// 只入缓存+触发 reconcile，零写入。
 	if cfg.GitHubApp.WebhookSecretFile != "" {
@@ -323,7 +485,16 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 // 机器一次性；私网优先，缺失用公网——IP 由 engine 侧选好传入）。
 type sshx struct{ keyFile string }
 
+// Diag 经 ssh 调机器上 cirunner diag --json（事故证据采集，§3.10.3）。
+func (s sshx) Diag(ctx context.Context, ip string) ([]byte, error) {
+	return s.run(ctx, ip, "/usr/local/bin/cirunner", "diag", "--json")
+}
+
 func (s sshx) Act(ctx context.Context, ip, action string) ([]byte, error) {
+	return s.run(ctx, ip, "/usr/local/bin/cirunner", "act", action, "--json")
+}
+
+func (s sshx) run(ctx context.Context, ip string, cmd ...string) ([]byte, error) {
 	args := []string{
 		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
 		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
@@ -331,11 +502,12 @@ func (s sshx) Act(ctx context.Context, ip, action string) ([]byte, error) {
 	if s.keyFile != "" {
 		args = append(args, "-i", s.keyFile)
 	}
-	args = append(args, "root@"+ip, "/usr/local/bin/cirunner", "act", action, "--json")
-	cmd := exec.CommandContext(ctx, "ssh", args...)
-	out, err := cmd.Output()
+	args = append(args, "root@"+ip)
+	args = append(args, cmd...)
+	c := exec.CommandContext(ctx, "ssh", args...)
+	out, err := c.Output()
 	if err != nil {
-		return nil, fmt.Errorf("ssh %s act %s: %w", ip, action, err)
+		return nil, fmt.Errorf("ssh %s %s: %w", ip, cmd, err)
 	}
 	return out, nil
 }

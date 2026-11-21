@@ -34,6 +34,7 @@ type GHFace interface {
 	MintToken(ctx context.Context, repo string) (string, error)
 	RemoveRunner(ctx context.Context, repo string, runnerID int64) error
 	ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error)
+	RerunFailedJobs(ctx context.Context, repo string, runID int64) error
 }
 
 // PoolOf 返回某仓所用池的 Provider（cmd 装配；profile→池的解析属装配层）。
@@ -86,11 +87,19 @@ type Engine struct {
 	States map[string]decide.RepoState
 	// OnIncident 是事故回调（阶段 5 接 incident 模块；nil = 仅记日志）。
 	OnIncident func(ctx context.Context, repo string, a decide.Action)
+	// OnRemedy 是"固定逻辑补救已执行"回调（A/B/C/D 的 SSHAct/强删动作；
+	// incident 模块据此记 incidents.jsonl，§3.10.1）。
+	OnRemedy func(ctx context.Context, repo, scenario, subject, detail string)
 	// Gate 是全局建机闸门（配额+预算互斥判定，复审修正 8；nil = 不设限，
 	// 仅测试用——daemon 必须注入）。
 	Gate *budget.Gate
+	// Now 可注入时钟（pause/池覆写判定用；默认 time.Now）。
+	Now func() time.Time
 
-	mu sync.Mutex
+	mu           sync.Mutex
+	lastObs      map[string]observe.Obs       // 仓 → 最近一轮观察（事故动作/证据用）
+	pausedUntil  map[string]time.Time         // pause_repo 动作（只拦建机）
+	poolOverride map[string]poolOverrideEntry // switch_pool 动作（临时改池）
 }
 
 // New 构造。
@@ -100,7 +109,10 @@ func New(cfg *config.Config, gh GHFace, providers map[string]machine.Provider, p
 	}
 	return &Engine{
 		Cfg: cfg, GH: gh, Providers: providers, PoolOf: poolOf, SSH: ssh, Renderer: r, Log: lg,
-		States: map[string]decide.RepoState{},
+		States:       map[string]decide.RepoState{},
+		lastObs:      map[string]observe.Obs{},
+		pausedUntil:  map[string]time.Time{},
+		poolOverride: map[string]poolOverrideEntry{},
 	}
 }
 
@@ -127,7 +139,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 		return nil, RoundStats{}, fmt.Errorf("collector 未注入")
 	}
 	p := e.Cfg.ProfileOf(repo)
-	pool := e.PoolOf(repo, p)
+	pool := e.poolFor(repo, p)
 	if pool.Provider == nil {
 		return nil, RoundStats{}, fmt.Errorf("仓 %s 的池未装配（PoolOf 未注入或池缺失）", repo.Repo)
 	}
@@ -135,6 +147,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	if err != nil {
 		e.Log.Printf("[%s] 观察不完整: %v", repo.Repo, err)
 	}
+	e.noteObs(repo.Repo, obs)
 	params := decide.Params{
 		MaxRunners:        repo.MaxRunners,
 		RunnersPerDroplet: p.RunnersPerDroplet,
@@ -152,6 +165,10 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 	if dryRun {
 		for _, a := range acts {
 			e.Log.Printf("[%s] dry-run %s: %s", repo.Repo, a.Kind, a.Reason)
+			// shadow 也观察事故（incident.Manager.DryRun 只记日志/jsonl，无副作用）
+			if a.Kind == decide.ActIncident {
+				e.fireIncident(ctx, repo, a)
+			}
 		}
 		return acts, stats, nil
 	}
@@ -164,7 +181,7 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 func (e *Engine) stats(repo config.RepoEntry, obs observe.Obs, params decide.Params) RoundStats {
 	p := e.Cfg.ProfileOf(repo)
 	st := RoundStats{N: len(obs.Machines), Complete: obs.Complete}
-	re := regexp.MustCompile(e.PoolOf(repo, p).Provider.Namer().Pattern(repo.NamePrefix()))
+	re := regexp.MustCompile(e.poolFor(repo, p).Provider.Namer().Pattern(repo.NamePrefix()))
 	for _, j := range obs.Jobs {
 		if j.Status == "queued" {
 			st.Q++
@@ -224,10 +241,15 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 	for _, a := range acts {
 		switch a.Kind {
 		case decide.ActCreate:
+			// pause_repo 动作（或人工）暂停建机：只拦建机，其余动作照常
+			if e.paused(repo.Repo) {
+				e.Log.Printf("[%s] 建机已暂停（pause_repo），跳过：%s", repo.Repo, a.Reason)
+				continue
+			}
 			// 全局配额+预算占坑（复审修正 8：Reserve→建机→Commit/Abort，
 			// 判定与建机之间的间隙不会让两仓抢掉同一个名额）
 			if e.Gate != nil {
-				res, ok, reason := e.Gate.Reserve(ctx, e.PoolOf(repo, e.Cfg.ProfileOf(repo)).Name)
+				res, ok, reason := e.Gate.Reserve(ctx, e.poolFor(repo, e.Cfg.ProfileOf(repo)).Name)
 				if !ok {
 					qAge := queueAge(obs)
 					e.Log.Printf("[%s] 跳过建机（场景 F）：%s", repo.Repo, reason)
@@ -284,6 +306,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 				continue
 			}
 			e.recordDeletion(obs, a.DropletID)
+			e.noteRemedy(ctx, repo, a)
 			e.Log.Printf("[%s] 已回收 %s（%s）", repo.Repo, a.DropletName, a.Reason)
 		case decide.ActForceDelete:
 			// 强删：先删机器再清注册（job 已判死/注册从未成功）
@@ -297,6 +320,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 			} else if a.RunnerName != "" {
 				e.removeRunnerByName(ctx, repo, a.RunnerName)
 			}
+			e.noteRemedy(ctx, repo, a)
 			e.Log.Printf("[%s] 已强删 %s（%s）", repo.Repo, a.DropletName, a.Reason)
 		case decide.ActRemoveReg:
 			if err := e.GH.RemoveRunner(ctx, repo.Repo, a.RunnerID); err != nil {
@@ -324,6 +348,19 @@ func (e *Engine) deleteMachine(ctx context.Context, obs observe.Obs, id string) 
 		return fmt.Errorf("机器 %s 不在本轮观察里，无法路由到池", id)
 	}
 	return e.Providers[pool].Delete(ctx, m.ID)
+}
+
+// noteRemedy 固定逻辑补救已执行（A/B/C/D 场景动作）→ OnRemedy 回调
+// （incident 模块记 incidents.jsonl；§3.10.1）。
+func (e *Engine) noteRemedy(ctx context.Context, repo config.RepoEntry, a decide.Action) {
+	if e.OnRemedy == nil || a.Scenario == "" {
+		return
+	}
+	subject := a.DropletName
+	if subject == "" {
+		subject = a.RunnerName
+	}
+	e.OnRemedy(ctx, repo.Repo, a.Scenario, subject, a.Reason)
 }
 
 // removeRunnerByName 按名清理注册（ForceDelete 时 id 缺失的兜底；顺带清
@@ -354,7 +391,7 @@ func (e *Engine) fireIncident(ctx context.Context, repo config.RepoEntry, a deci
 // 取、cloud-init 落盘/清理由 Provider 负责）。返回机器名（Gate 占坑沉淀用）。
 func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs) (string, error) {
 	p := e.Cfg.ProfileOf(repo)
-	prov := e.PoolOf(repo, p).Provider
+	prov := e.poolFor(repo, p).Provider
 	name := prov.Namer().Next(repo.NamePrefix(), machineNames(obs.Machines))
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()

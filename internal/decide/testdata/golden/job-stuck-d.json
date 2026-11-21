@@ -55,6 +55,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "D",
         "IncidentKey": "",
         "Reason": "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）"
       },

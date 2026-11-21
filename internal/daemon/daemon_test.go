@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/incident"
 	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/machine/machinetest"
 	"github.com/hoshinojian/ciorch/internal/observe"
@@ -169,10 +172,96 @@ func (f *recGH) RemoveRunner(ctx context.Context, repo string, id int64) error {
 func (f *recGH) ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error) {
 	return nil, nil
 }
+func (f *recGH) RerunFailedJobs(ctx context.Context, repo string, runID int64) error {
+	return nil
+}
 
 type recSSH struct{ acts []string }
 
 func (f *recSSH) Act(ctx context.Context, ip, action string) ([]byte, error) {
 	f.acts = append(f.acts, ip+":"+action)
 	return nil, nil
+}
+
+// 阶段 5 集成：daemon 一轮（dry-run）→ 引擎事故动作 → incident.Manager（DryRun）
+// 只记 jsonl/日志，零 issue 副作用；时间线有观察摘要。
+func TestDaemonDryRunIncidentNoSideEffects(t *testing.T) {
+	o := observe.Obs{Now: time.Now(), Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.UnmatchedQueued = []observe.Job{{ID: 9, RunID: 1, Status: "queued", CreatedAt: time.Now().Add(-6 * time.Minute), Labels: []string{"nonexistent"}}}
+
+	gh := &recGH{}
+	pool := machinetest.NewFake("go-heavy")
+	ssh := &recSSH{}
+	cfg := &config.Config{
+		StateDir: t.TempDir(),
+		Global:   config.GlobalCfg{MaxMachines: 2, DailyBudgetUSD: 5},
+		Profiles: map[string]config.Profile{
+			"go-heavy": {Pools: []string{"go-heavy"}, RunnersPerDroplet: 1},
+		},
+		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
+	}
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
+	e := engine.New(cfg, gh, providers, poolOf, ssh, nil, log.New(io.Discard, "", 0))
+	e.SetCollector(&fixedObs{o})
+
+	issues := &fakeIncIssues{}
+	stateDir := t.TempDir()
+	mgr := incident.New(issues, e, incident.Options{MaintainerLogin: "maint"}, stateDir, log.New(io.Discard, "", 0))
+	mgr.DryRun = true
+	e.OnIncident = func(ctx context.Context, repo string, a decide.Action) {
+		_ = mgr.Handle(ctx, repo, a)
+	}
+
+	d := New(cfg, e, &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
+	d.DryRun = true
+	d.Incidents = mgr
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], true); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Note(cfg.Repos[0].Repo, "observe", "Q=0")
+	mgr.Tick(context.Background(), cfg.Repos[0].Repo)
+
+	if issues.created+issues.comments+issues.closed+issues.reopened+issues.ensured != 0 {
+		t.Fatalf("dry-run 事故模块必须零 issue 副作用：%+v", issues)
+	}
+	if len(pool.Created)+len(pool.Deleted)+len(ssh.acts) != 0 {
+		t.Fatal("dry-run 引擎必须零写动作")
+	}
+	// jsonl 已记（detected）
+	raw, err := os.ReadFile(filepath.Join(stateDir, "incidents.jsonl"))
+	if err != nil || !strings.Contains(string(raw), "\"event\":\"detected\"") {
+		t.Fatalf("dry-run 应记 incidents.jsonl：%v %s", err, raw)
+	}
+}
+
+// fakeIncIssues：零容忍的假 issue API（任何调用都算副作用）。
+type fakeIncIssues struct {
+	created, comments, closed, reopened, ensured int
+}
+
+func (f *fakeIncIssues) EnsureLabels(ctx context.Context, repo string, labels []string) error {
+	f.ensured++
+	return nil
+}
+func (f *fakeIncIssues) CreateIssue(ctx context.Context, repo, title, body string, labels []string) (githubapp.Issue, error) {
+	f.created++
+	return githubapp.Issue{Number: 1}, nil
+}
+func (f *fakeIncIssues) AddIssueComment(ctx context.Context, repo string, number int64, body string) error {
+	f.comments++
+	return nil
+}
+func (f *fakeIncIssues) AddIssueLabels(ctx context.Context, repo string, number int64, labels []string) error {
+	return nil
+}
+func (f *fakeIncIssues) CloseIssue(ctx context.Context, repo string, number int64) error {
+	f.closed++
+	return nil
+}
+func (f *fakeIncIssues) ReopenIssue(ctx context.Context, repo string, number int64) error {
+	f.reopened++
+	return nil
 }

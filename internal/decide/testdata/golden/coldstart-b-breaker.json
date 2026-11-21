@@ -10,6 +10,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "B",
         "IncidentKey": "",
         "Reason": "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）"
       },
@@ -64,6 +65,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "B",
         "IncidentKey": "",
         "Reason": "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）"
       },
@@ -118,6 +120,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "",
+        "scenario": "B",
         "IncidentKey": "",
         "Reason": "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）"
       },

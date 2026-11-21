@@ -112,7 +112,8 @@ func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		st.Machines[name] = ms
 		emit(Action{
 			Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
-			Reason: "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）",
+			Scenario: "C",
+			Reason:   "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）",
 		})
 		if countRecent(st.OfflineEvents, obs.Now, stallHistoryWindow) >= 2 {
 			emit(Action{Kind: ActIncident, IncidentType: "C", IncidentKey: name,
@@ -148,7 +149,8 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		st.Machines[name] = ms
 		emit(Action{
 			Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
-			Reason: "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）",
+			Scenario: "B",
+			Reason:   "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）",
 		})
 		// 熔断计数（C 不计入）
 		st.Breaker.Fails++
@@ -229,7 +231,8 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			if r.Status == "online" {
 				emit(Action{
 					Kind: ActSSHAct, DropletName: name, RunnerID: r.ID, RunnerName: r.Name,
-					SSHAct: "restart-runner", Reason: "场景 A 假活（P139）：online 不接活，先重启 Listener",
+					SSHAct: "restart-runner", Scenario: "A",
+					Reason: "场景 A 假活（P139）：online 不接活，先重启 Listener",
 				})
 			}
 		}
@@ -279,7 +282,8 @@ func scenarioD(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			st.Machines[name] = ms
 			emit(Action{
 				Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
-				Reason: "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）",
+				Scenario: "D",
+				Reason:   "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）",
 			})
 		}
 	}

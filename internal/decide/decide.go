@@ -40,8 +40,11 @@ type Action struct {
 	RunnerName   string
 	SSHAct       string // restart-runner / stop-runner / clean-work
 	IncidentType string // 场景代码 A~J
-	IncidentKey  string // 事故键主体（机器名/label 组合/空）
-	Reason       string
+	// Scenario 标注补救/回收动作的来源场景（A/B/C/D——incident 模块据此
+	// 记"固定逻辑补救"jsonl；ActIncident 动作用 IncidentType，此字段为空）。
+	Scenario    string `json:"scenario,omitempty"`
+	IncidentKey string // 事故键主体（机器名/label 组合/空）
+	Reason      string
 }
 
 // MachineState 是单台机器的跨轮记忆（§3.6.1，key = 机器名）。
