@@ -1,0 +1,6 @@
+# Caddyfile 模板（REDESIGN §3.14）——公网 TLS 反代到 ciorch 的 127.0.0.1:8080。
+# 主机名用 sslip.io（IP 以-连接，免买域名；<PUBLIC_IP> 部署时替换），
+# Caddy 自动申请 Let's Encrypt 证书。【V5：LE 对 sslip.io 的签发实测】
+<PUBLIC_IP>.sslip.io {
+	reverse_proxy 127.0.0.1:8080
+}
