@@ -443,13 +443,24 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	// HTTP 面（§3.11）：webhook secret 文件配置了才起；dry-run 下同样
 	// 只入缓存+触发 reconcile，零写入。
 	if cfg.GitHubApp.WebhookSecretFile != "" {
-		secret, err := os.ReadFile(cfg.GitHubApp.WebhookSecretFile)
+		secret, err := readWebhookSecret(cfg.GitHubApp.WebhookSecretFile)
 		if err != nil {
-			return fmt.Errorf("读 webhook secret: %w", err)
+			return err
 		}
 		whitelist := map[string]bool{}
+		issueWatch := map[string]bool{}
 		for _, r := range cfg.Repos {
 			whitelist[r.Repo] = true
+			issueWatch[r.Repo] = true
+			// 事故 issue 可改投 issue_repo：issues 事件白名单要包含它
+			// （workflow_job 仍只看 whitelist——issue_repo 仓的 job 不进观察缓存）
+			if r.IssueRepo != "" {
+				issueWatch[r.IssueRepo] = true
+			}
+		}
+		appBot := ""
+		if cfg.GitHubApp.AppSlug != "" {
+			appBot = cfg.GitHubApp.AppSlug + "[bot]"
 		}
 		statusToken := ""
 		if cfg.StatusTokenFile != "" {
@@ -462,13 +473,19 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 		d.Handler = server.New(server.Deps{
 			WebhookSecret: secret,
 			Repos:         whitelist,
+			IssueWatch:    issueWatch,
+			AppBotLogin:   appBot,
 			Cache:         rt.collector.Cache,
 			Trigger:       d.Trigger,
-			LastOK:        d.LastOKTime,
-			PollIdle:      d.PollIdle,
-			StatusToken:   statusToken,
-			StatusBody:    d.StatusSnapshot,
-			Log:           log.Default(),
+			// 人工关闭 issue → 事故模块（§3.10.6）：resolved + 清熔断/退避/pause
+			OnIssueClosed: func(repo string, number int) {
+				rt.incidents.HumanResolved(repo, int64(number))
+			},
+			LastOK:      d.LastOKTime,
+			PollIdle:    d.PollIdle,
+			StatusToken: statusToken,
+			StatusBody:  d.StatusSnapshot,
+			Log:         log.Default(),
 		})
 		d.ListenAddr = cfg.Listen
 	}
@@ -479,6 +496,21 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	return d.Run(ctx)
+}
+
+// readWebhookSecret 读 webhook secret 文件：去掉首尾空白（shell 重定向生成的
+// 文件普遍带末尾换行，GitHub App 设置页里填的 secret 不带——两边对不上会让
+// 所有 webhook 401）并拒绝过短 secret（去空白后 <16 字节 = 任何人可伪造）。
+func readWebhookSecret(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读 webhook secret: %w", err)
+	}
+	secret := bytes.TrimSpace(raw)
+	if len(secret) < 16 {
+		return nil, fmt.Errorf("webhook secret %s 去空白后长度 %d <16（拒绝启动：空/过短 secret 等于任何人可伪造签名）", path, len(secret))
+	}
+	return secret, nil
 }
 
 // sshx 经系统 ssh 子进程调机器上 cirunner act（§3.8：不维护 known_hosts、

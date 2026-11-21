@@ -204,3 +204,59 @@ func TestStatusAuth(t *testing.T) {
 		t.Fatalf("载荷不对: %v", rec.Body.String())
 	}
 }
+
+// 审查修复 3：编排器自己关 issue（sender 是本 App bot）不算人工关闭，忽略。
+func TestIssuesClosedByAppBotIgnored(t *testing.T) {
+	closed := []string{}
+	d := Deps{
+		WebhookSecret: []byte("s"),
+		Repos:         map[string]bool{"o/r": true},
+		AppBotLogin:   "ciorch[bot]",
+		OnIssueClosed: func(repo string, number int) { closed = append(closed, repo) },
+	}
+	h := New(d)
+	body := []byte(`{"action":"closed","repository":{"full_name":"o/r"},
+		"issue":{"number":7,"labels":[{"name":"ciorch"}]},
+		"sender":{"login":"ciorch[bot]","type":"Bot"}}`)
+	if rec := postWebhook(t, h, "issues", "s", body); rec.Code != http.StatusOK {
+		t.Fatalf("bot 关闭应 200 忽略：%d", rec.Code)
+	}
+	if len(closed) != 0 {
+		t.Fatalf("App bot 触发的关闭不应回调 OnIssueClosed：%v", closed)
+	}
+	// 同一个 bot 名以外的 Bot（如其他 App）不在此过滤范围（登录名不同）
+	body2 := []byte(`{"action":"closed","repository":{"full_name":"o/r"},
+		"issue":{"number":8,"labels":[{"name":"ciorch"}]},
+		"sender":{"login":"other-app[bot]","type":"Bot"}}`)
+	postWebhook(t, h, "issues", "s", body2)
+	if len(closed) != 1 {
+		t.Fatalf("非本 App 的关闭仍应回调：%v", closed)
+	}
+}
+
+// 顺手修：issues 事件白名单包含 issue_repo（IssueWatch），workflow_job 仍只看 Repos。
+func TestIssueWatchIncludesIssueRepo(t *testing.T) {
+	closed := []string{}
+	d := Deps{
+		WebhookSecret: []byte("s"),
+		Repos:         map[string]bool{"o/runner": true},
+		IssueWatch:    map[string]bool{"o/runner": true, "o/ops-issues": true},
+		OnIssueClosed: func(repo string, number int) { closed = append(closed, repo) },
+	}
+	h := New(d)
+	// issue 开在改投仓 o/ops-issues → 应回调
+	body := []byte(`{"action":"closed","repository":{"full_name":"o/ops-issues"},
+		"issue":{"number":7,"labels":[{"name":"ciorch"}]},"sender":{"login":"human","type":"User"}}`)
+	if rec := postWebhook(t, h, "issues", "s", body); rec.Code != http.StatusOK || len(closed) != 1 {
+		t.Fatalf("issue_repo 的关闭应回调：%d %v", rec.Code, closed)
+	}
+	// 该仓的 workflow_job 事件不在 Repos 白名单 → 丢弃（不触发、不进缓存）
+	job := []byte(`{"action":"queued","repository":{"full_name":"o/ops-issues"},
+		"workflow_job":{"id":1,"run_id":1,"status":"queued"}}`)
+	triggers := 0
+	d.Trigger = func(repo string) { triggers++ }
+	postWebhook(t, h, "workflow_job", "s", job)
+	if triggers != 0 {
+		t.Fatal("issue_repo 的 workflow_job 不应触发 reconcile（防串仓）")
+	}
+}

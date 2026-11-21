@@ -595,6 +595,7 @@ waiting-human ──issue 被人关闭──► resolved（并清熔断、解除
 | D job 卡死 | none, drain_droplet, rerun_failed_jobs |
 | E label 不匹配 | none（只能建议人改配置） |
 | F 配额不足 | none, drain_droplet（限其他仓空闲机） |
+| G 外部 runner 假活 | none（只告知：开 issue 后直接 waiting-human，不调 LLM——外部 runner 不归本编排器所辖，2026-11-21 阶段 5 实现口径） |
 | H 观察失败 / I 建机报错 | none, pause_repo |
 | J 孤儿机器 | none（必须人确认） |
 

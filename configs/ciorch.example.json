@@ -1,6 +1,7 @@
 {
   "github_app": {
     "app_id": 123456,
+    "app_slug": "<app-slug>",
     "private_key_file": "/etc/ciorch/app.pem",
     "webhook_secret_file": "/etc/ciorch/webhook.secret"
   },

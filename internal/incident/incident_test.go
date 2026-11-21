@@ -387,3 +387,66 @@ func TestSnapshotRestore(t *testing.T) {
 		t.Fatal("恢复后同键活跃事故应去重")
 	}
 }
+
+// 顺手修：issue 开在 issue_repo（改投仓）时，HumanResolved 按 IssueRepo 匹配。
+func TestHumanResolvedMatchesIssueRepo(t *testing.T) {
+	issues, exec := &fakeIssues{}, &fakeExec{}
+	m, _ := newMgr(t, issues, exec)
+	m.Opt.IssueRepoOf = func(repo string) string { return "o/ops-issues" }
+	_ = m.Handle(context.Background(), "o/runner", actA("m1", "r"))
+	if issues.created[0].repo != "o/ops-issues" {
+		t.Fatalf("issue 应开在改投仓：%+v", issues.created[0])
+	}
+	// 用托管仓名匹配：找不到（不误清）
+	m.HumanResolved("o/runner", 1)
+	if len(exec.cleared) != 0 {
+		t.Fatal("托管仓名匹配不上不应清熔断")
+	}
+	// 用 issue 所在仓名匹配：生效
+	m.HumanResolved("o/ops-issues", 1)
+	if len(exec.cleared) != 1 || exec.cleared[0] != "o/runner" {
+		t.Fatalf("应按 IssueRepo 匹配并清 o/runner：%v", exec.cleared)
+	}
+}
+
+// 审查修复 3（事故侧防护）：自动恢复已关闭的 issue 再来 issues.closed（编排器
+// 自己关的回声）→ 事故已是 resolved → 不清熔断/退避/pause。
+func TestHumanResolvedIgnoresAlreadyResolved(t *testing.T) {
+	issues, exec := &fakeIssues{}, &fakeExec{}
+	m, _ := newMgr(t, issues, exec)
+	_ = m.Handle(context.Background(), "o/r", actA("m1", "r"))
+	m.Tick(context.Background(), "o/r")
+	m.Tick(context.Background(), "o/r") // 自动恢复 → resolved + 关闭 issue
+	// 回声 webhook：不应产生任何人工清理
+	m.HumanResolved("o/r", 1)
+	if len(exec.cleared) != 0 {
+		t.Fatal("resolved 事故的关闭回声不应清熔断")
+	}
+	// 复发（24h 内）重新打开后，人工关闭才生效
+	_ = m.Handle(context.Background(), "o/r", actA("m1", "again"))
+	m.HumanResolved("o/r", 1)
+	if len(exec.cleared) != 1 {
+		t.Fatal("复发后的人工关闭应清熔断")
+	}
+}
+
+// 持久化：Snapshot→新 Manager Restore 后，关 issue 仍能找到事故并清理
+// （证明"重启后关 issue 找得到对应事故"）。
+func TestRestoreThenHumanResolved(t *testing.T) {
+	issues, exec := &fakeIssues{}, &fakeExec{}
+	m, _ := newMgr(t, issues, exec)
+	_ = m.Handle(context.Background(), "o/r", actA("m1", "r"))
+	snap := m.Snapshot()
+
+	issues2, exec2 := &fakeIssues{}, &fakeExec{}
+	m2 := New(issues2, exec2, Options{MaintainerLogin: "maint"}, t.TempDir(), nil)
+	m2.Now = func() time.Time { return t0 }
+	m2.Restore(snap)
+	m2.HumanResolved("o/r", 1)
+	if inc := m2.incidents[Key{"o/r", "A", "m1"}]; inc == nil || inc.State != StateResolved {
+		t.Fatal("重启恢复后应能按 issue 号找到事故并置 resolved")
+	}
+	if len(exec2.cleared) != 1 {
+		t.Fatal("重启恢复后人工关闭应清熔断")
+	}
+}

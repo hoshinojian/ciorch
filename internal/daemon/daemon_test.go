@@ -211,6 +211,7 @@ func TestDaemonDryRunIncidentNoSideEffects(t *testing.T) {
 	stateDir := t.TempDir()
 	mgr := incident.New(issues, e, incident.Options{MaintainerLogin: "maint"}, stateDir, log.New(io.Discard, "", 0))
 	mgr.DryRun = true
+	mgr.RestoreLLM(time.Now().UTC().Format("2006-01-02"), 1) // 预置日额：证明 llm_day 字段落盘
 	e.OnIncident = func(ctx context.Context, repo string, a decide.Action) {
 		_ = mgr.Handle(ctx, repo, a)
 	}
@@ -218,9 +219,13 @@ func TestDaemonDryRunIncidentNoSideEffects(t *testing.T) {
 	d := New(cfg, e, &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 	d.DryRun = true
 	d.Incidents = mgr
+	// 走 daemon 的 round（而非裸 Reconcile）：把摘要喂进时间线、推进 Tick、
+	// 并把事故表持久化进 state.json（证明重启后关 issue 找得到事故）
+	statePath := filepath.Join(cfg.StateDir, "state.json")
 	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], true); err != nil {
 		t.Fatal(err)
 	}
+	d.round(context.Background(), cfg.Repos[0], statePath)
 	mgr.Note(cfg.Repos[0].Repo, "observe", "Q=0")
 	mgr.Tick(context.Background(), cfg.Repos[0].Repo)
 
@@ -234,6 +239,11 @@ func TestDaemonDryRunIncidentNoSideEffects(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(stateDir, "incidents.jsonl"))
 	if err != nil || !strings.Contains(string(raw), "\"event\":\"detected\"") {
 		t.Fatalf("dry-run 应记 incidents.jsonl：%v %s", err, raw)
+	}
+	// state.json 含事故表与 LLM 日额（§3.12：重启恢复）
+	sj, err := os.ReadFile(statePath)
+	if err != nil || !strings.Contains(string(sj), "\"incidents\"") || !strings.Contains(string(sj), "\"llm_day\"") {
+		t.Fatalf("state.json 应持久化事故表与 LLM 日额：%v %s", err, sj)
 	}
 }
 

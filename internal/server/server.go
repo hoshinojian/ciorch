@@ -22,8 +22,16 @@ import (
 type Deps struct {
 	// WebhookSecret 验签密钥（X-Hub-Signature-256）。
 	WebhookSecret []byte
-	// Repos 是白名单（owner/name → true）：不在名单的仓直接 200 丢弃。
+	// Repos 是 workflow_job 白名单（owner/name → true）：不在名单的仓直接 200 丢弃。
 	Repos map[string]bool
+	// IssueWatch 是 issues 事件白名单（repos ∪ 各仓 issue_repo——事故 issue 可能
+	// 改投到别的仓；nil 时退回 Repos）。注意 workflow_job 仍只看 Repos：
+	// issue_repo 的 job 不该进观察缓存（防串仓）。
+	IssueWatch map[string]bool
+	// AppBotLogin 是本 App 的 bot 账号登录名（形如 "<slug>[bot]"）。编排器自己
+	// 关 issue 触发的 issues.closed（sender 是 App bot）不算人工关闭，忽略；
+	// 空 = 不启用该过滤（仍有事故侧状态防护兜底）。
+	AppBotLogin string
 	// Cache 是 observe 的 webhook job 缓存（写入 workflow_job 快照）。
 	Cache *observe.JobCache
 	// Trigger 请求某仓立即 reconcile（2s 防抖由 daemon.Trigger 合并）。
@@ -160,6 +168,11 @@ type issuesEvent struct {
 			Name string `json:"name"`
 		} `json:"labels"`
 	} `json:"issue"`
+	// Sender 是动作发起者；编排器自己（App bot）触发的关闭不算人工关闭
+	Sender struct {
+		Login string `json:"login"`
+		Type  string `json:"type"`
+	} `json:"sender"`
 }
 
 func (d *Deps) handleIssues(w http.ResponseWriter, body []byte) {
@@ -169,6 +182,25 @@ func (d *Deps) handleIssues(w http.ResponseWriter, body []byte) {
 		return
 	}
 	if ev.Action != "closed" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// 白名单：issue 可能改投到 issue_repo（不在 Repos 里）
+	watch := d.IssueWatch
+	if watch == nil {
+		watch = d.Repos
+	}
+	if !watch[ev.Repository.FullName] {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	// 编排器自己关的 issue（事故自动恢复/人工清理路径都会由 App 关闭）：
+	// sender 是本 App bot → 不是人工关闭，忽略（防自触发清掉熔断/退避/pause）
+	if d.AppBotLogin != "" && ev.Sender.Type == "Bot" && ev.Sender.Login == d.AppBotLogin {
+		if d.Log != nil {
+			d.Log.Printf("[webhook] issues.closed repo=%s #%d 由 App bot（%s）发起，忽略",
+				ev.Repository.FullName, ev.Issue.Number, ev.Sender.Login)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
