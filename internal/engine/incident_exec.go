@@ -82,7 +82,7 @@ func (e *Engine) ReplaceMachine(ctx context.Context, repo, machineName string) e
 			if !ok {
 				return fmt.Errorf("配额/预算：%s", reason)
 			}
-			created, err := e.create(ctx, entry, e.lastObsOf(repo))
+			created, err := e.create(ctx, entry, e.lastObsOf(repo), nil)
 			if err != nil {
 				e.Gate.Abort(res)
 				return err
@@ -90,7 +90,7 @@ func (e *Engine) ReplaceMachine(ctx context.Context, repo, machineName string) e
 			e.Gate.Commit(res, created)
 			return nil
 		}
-		_, err := e.create(ctx, entry, e.lastObsOf(repo))
+		_, err := e.create(ctx, entry, e.lastObsOf(repo), nil)
 		return err
 	}
 	if err := tryCreate(); err == nil {
