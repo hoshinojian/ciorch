@@ -75,10 +75,11 @@ type RepoState struct {
 	Breaker            Breaker
 	CreateBackoffUntil time.Time
 	CreateFailStreak   int
-	LastActivity       []time.Time // 近 2h job 开跑时间点（自适应空闲），≤20 个
-	StallEvents        []time.Time // 场景 A 触发补救的时刻
-	OfflineEvents      []time.Time // 场景 C 触发处置的时刻
-	ObserveFailStreak  int         // 场景 H 连续 Complete=false 轮数
+	LastActivity       []time.Time         // 近 2h job 开跑时间点（自适应空闲），≤20 个
+	RecordedRuns       map[int64]time.Time // LastActivity 已记过的 RunID → 该 run 首个开跑点（跨轮去重，随 2h 窗口淘汰）
+	StallEvents        []time.Time         // 场景 A 触发补救的时刻
+	OfflineEvents      []time.Time         // 场景 C 触发处置的时刻
+	ObserveFailStreak  int                 // 场景 H 连续 Complete=false 轮数
 }
 
 // Params 是决策参数（§3.6.6，零值字段取默认）。
@@ -299,6 +300,10 @@ func cloneState(st RepoState) RepoState {
 		out.Machines[k] = v
 	}
 	out.LastActivity = append([]time.Time(nil), st.LastActivity...)
+	out.RecordedRuns = make(map[int64]time.Time, len(st.RecordedRuns))
+	for k, v := range st.RecordedRuns {
+		out.RecordedRuns[k] = v
+	}
 	out.StallEvents = append([]time.Time(nil), st.StallEvents...)
 	out.OfflineEvents = append([]time.Time(nil), st.OfflineEvents...)
 	return out
@@ -396,17 +401,35 @@ func supply(p Params, st RepoState, views map[string]*machineView, now time.Time
 
 func recordActivity(st *RepoState, obs observe.Obs) {
 	// 按不同 RunID 各记一个时间点（复审修正：按 job 记会让一个 run 的 7 个
-	// job 跑一次就满足"近 2h 活跃≥2 次"，空闲阈值几乎永远 45 分钟档）
-	byRun := map[int64]time.Time{}
+	// job 跑一次就满足"近 2h 活跃≥2 次"，空闲阈值几乎永远 45 分钟档）。
+	// 跨轮去重必须落在状态里（RecordedRuns，首见即定）：轮内 byRun 不够——
+	// job 错峰开跑时每轮快照里该 run 的"最新开跑时刻"都不同，会为同一 run
+	// 反复追加新点（2026-11-21 冒烟实测：单 run 8 job 记了 8 个点）。取该
+	// run 首次可见轮里最早的 job 开跑时刻，之后不再改、不再补。
+	if st.RecordedRuns == nil {
+		st.RecordedRuns = map[int64]time.Time{}
+	}
+	newRuns := map[int64]time.Time{}
 	for _, j := range obs.Jobs {
-		if j.Status == "in_progress" && !j.StartedAt.IsZero() {
-			if t, ok := byRun[j.RunID]; !ok || j.StartedAt.After(t) {
-				byRun[j.RunID] = j.StartedAt
-			}
+		if j.Status != "in_progress" || j.StartedAt.IsZero() {
+			continue
+		}
+		if _, done := st.RecordedRuns[j.RunID]; done {
+			continue
+		}
+		if t, ok := newRuns[j.RunID]; !ok || j.StartedAt.Before(t) {
+			newRuns[j.RunID] = j.StartedAt
 		}
 	}
-	for _, t := range byRun {
+	for id, t := range newRuns {
+		st.RecordedRuns[id] = t
 		st.LastActivity = append(st.LastActivity, t)
+	}
+	// 出窗的 RunID 淘汰（防 map 无界增长；与 LastActivity 同窗同寿）
+	for id, t := range st.RecordedRuns {
+		if obs.Now.Sub(t) > lastActivityWindow {
+			delete(st.RecordedRuns, id)
+		}
 	}
 	sort.Slice(st.LastActivity, func(i, j int) bool { return st.LastActivity[i].Before(st.LastActivity[j]) })
 	out := st.LastActivity[:0]

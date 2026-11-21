@@ -49,6 +49,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -104,6 +105,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -170,6 +172,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -189,6 +192,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -220,6 +224,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -251,6 +256,7 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": null,
+      "RecordedRuns": {},
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0

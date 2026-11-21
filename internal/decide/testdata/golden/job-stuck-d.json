@@ -39,6 +39,9 @@
       "LastActivity": [
         "2026-11-20T10:59:00Z"
       ],
+      "RecordedRuns": {
+        "1": "2026-11-20T10:59:00Z"
+      },
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -94,9 +97,11 @@
       "CreateBackoffUntil": "0001-01-01T00:00:00Z",
       "CreateFailStreak": 0,
       "LastActivity": [
-        "2026-11-20T10:29:00Z",
         "2026-11-20T10:59:00Z"
       ],
+      "RecordedRuns": {
+        "1": "2026-11-20T10:59:00Z"
+      },
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
