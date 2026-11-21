@@ -1,6 +1,9 @@
-// Package config 加载并校验 ciorch 配置（schema 对齐 docs/REDESIGN.md §3.3）。
+// Package config 加载并校验 ciorch 配置（schema 对齐 docs/REDESIGN.md §3.3
+// 与 docs/PROVIDER-ABSTRACTION.md §3.3：机器来源池化，profile 只描述 runner）。
 // 未知字段一律拒绝（DisallowUnknownFields）：调度参数拼错键名而静默走默认值
 // （如 max_runners→1）的风险，大于前向兼容损失（配置与二进制同版本演进）。
+// 遇到旧字段（vpsctl_bin/max_droplets/profile 内建机参数等）给出明确迁移
+// 提示，不做向后兼容解析——现存配置只有 shadow 用的一份，一次到位。
 package config
 
 import (
@@ -12,6 +15,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/hoshinojian/ciorch/internal/machine"
 )
 
 // GitHubAppCfg 是 GitHub App 凭据位置（认证实现在阶段 3，schema 先行）。
@@ -29,7 +34,7 @@ type MachineAgentCfg struct {
 
 // GlobalCfg 是全局配额与预算。
 type GlobalCfg struct {
-	MaxDroplets    int               `json:"max_droplets"`
+	MaxMachines    int               `json:"max_machines"`
 	DailyBudgetUSD float64           `json:"daily_budget_usd"`
 	Tuning         map[string]string `json:"tuning"` // 决策参数覆盖（键名见 §3.6.6，decide 侧解析）
 }
@@ -43,14 +48,59 @@ type LLMCfg struct {
 	MaxCallsPerDay      int    `json:"max_calls_per_day"`
 }
 
-// Profile 是一类 runner 机器的建机配方。
+// PoolCfg 是一个机器池：一组同来源同规格的机器。provider 选实现；与
+// provider 同名的子对象是该实现的私有配置（只有对应实现解析，其余字段
+// 一律拒绝）；max_machines 是池容量上限。
+type PoolCfg struct {
+	Provider    string
+	MaxMachines int
+	Raw         json.RawMessage // 实现私有配置子对象（Factory 解析）
+}
+
+// UnmarshalJSON 严格解析：只允许 provider / max_machines / <与 provider 同名
+// 的实现子对象> 三个键（外层 DisallowUnknownFields 对自定义 Unmarshaler 不
+// 生效，严格性由本方法保证）。
+func (p *PoolCfg) UnmarshalJSON(b []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	get := func(key string, dst any) error {
+		raw, ok := m[key]
+		if !ok {
+			return nil
+		}
+		delete(m, key)
+		return json.Unmarshal(raw, dst)
+	}
+	if err := get("provider", &p.Provider); err != nil {
+		return err
+	}
+	if err := get("max_machines", &p.MaxMachines); err != nil {
+		return err
+	}
+	var extra []string
+	for k := range m {
+		extra = append(extra, k)
+	}
+	switch {
+	case len(extra) == 0:
+		// 无实现子对象：由 Factory 报"缺配置"
+	case len(extra) > 1:
+		return fmt.Errorf("池配置只允许 provider/max_machines/<实现子对象>，多余字段：%v", extra)
+	default:
+		if extra[0] != p.Provider {
+			return fmt.Errorf("池配置子对象 %q 与 provider %q 不匹配（实现私有配置须以 provider 名为键）", extra[0], p.Provider)
+		}
+		p.Raw = m[extra[0]]
+	}
+	return nil
+}
+
+// Profile 是一类 runner 的配方：长什么样（labels、每机 runner 数）、用哪些池。
+// 建机参数已移入池配置（§3.3）。
 type Profile struct {
-	Account           string   `json:"account"`
-	Region            string   `json:"region"`
-	FallbackRegions   []string `json:"fallback_regions"`
-	Size              string   `json:"size"`
-	Image             string   `json:"image"`
-	Snapshot          string   `json:"snapshot"`
+	Pools             []string `json:"pools"` // 有序列表（将来"本地优先、DO 溢出"预留；当前强制长度 1）
 	Labels            []string `json:"labels"`
 	RunnersPerDroplet int      `json:"runners_per_droplet"`
 }
@@ -65,26 +115,24 @@ type RepoEntry struct {
 
 // Config 是完整配置。
 type Config struct {
-	GitHubApp          GitHubAppCfg       `json:"github_app"`
-	VPSctlBin          string             `json:"vpsctl_bin"`
-	VPSctlAccountsFile string             `json:"vpsctl_accounts_file"`
-	SSHPrivateKeyFile  string             `json:"ssh_private_key_file"`
-	SSHPublicKeyFiles  []string           `json:"ssh_public_key_files"`
-	MachineAgent       MachineAgentCfg    `json:"machine_agent"`
-	Listen             string             `json:"listen"`
-	StateDir           string             `json:"state_dir"`
-	Global             GlobalCfg          `json:"global"`
-	LLM                LLMCfg             `json:"llm"`
-	MaintainerLogin    string             `json:"maintainer_login"`
-	Profiles           map[string]Profile `json:"profiles"`
-	Repos              []RepoEntry        `json:"repos"`
-	TokenFile          string             `json:"token_file"` // 阶段 1-2 临时 token 源（App 认证前）
+	GitHubApp         GitHubAppCfg       `json:"github_app"`
+	Pools             map[string]PoolCfg `json:"pools"`
+	SSHPrivateKeyFile string             `json:"ssh_private_key_file"`
+	SSHPublicKeyFiles []string           `json:"ssh_public_key_files"`
+	MachineAgent      MachineAgentCfg    `json:"machine_agent"`
+	Listen            string             `json:"listen"`
+	StateDir          string             `json:"state_dir"`
+	Global            GlobalCfg          `json:"global"`
+	LLM               LLMCfg             `json:"llm"`
+	MaintainerLogin   string             `json:"maintainer_login"`
+	Profiles          map[string]Profile `json:"profiles"`
+	Repos             []RepoEntry        `json:"repos"`
+	TokenFile         string             `json:"token_file"` // 阶段 1-2 临时 token 源（App 认证前）
 }
 
 var (
-	repoRe   = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
-	labelRe  = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	regionRe = regexp.MustCompile(`^[a-z]+[0-9]+$`) // DO slug 形如 sgp1/nyc3/blr1（无连字符）
+	repoRe  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+	labelRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 )
 
 // Load 读取并校验配置（错误信息中文、指出字段路径）。
@@ -92,6 +140,9 @@ func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
+	}
+	if err := checkLegacyFields(raw); err != nil {
+		return nil, fmt.Errorf("配置 %s 使用旧 schema: %w", path, err)
 	}
 	var c Config
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -105,7 +156,69 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
+// checkLegacyFields 检出旧 schema 字段并给出迁移提示（不做兼容解析）。
+func checkLegacyFields(raw []byte) error {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil // 解析失败由后续 decode 报错
+	}
+	var hits []string
+	if _, ok := top["vpsctl_bin"]; ok {
+		hits = append(hits, "顶层 vpsctl_bin → pools.<池名>.vpsctl.bin")
+	}
+	if _, ok := top["vpsctl_accounts_file"]; ok {
+		hits = append(hits, "顶层 vpsctl_accounts_file → pools.<池名>.vpsctl.accounts_file")
+	}
+	if g, ok := top["global"]; ok {
+		var gm map[string]json.RawMessage
+		if json.Unmarshal(g, &gm) == nil {
+			if _, ok := gm["max_droplets"]; ok {
+				hits = append(hits, "global.max_droplets → global.max_machines")
+			}
+		}
+	}
+	if ps, ok := top["profiles"]; ok {
+		var pm map[string]map[string]json.RawMessage
+		if json.Unmarshal(ps, &pm) == nil {
+			legacyKeys := []string{"account", "region", "size", "image", "snapshot", "fallback_regions"}
+			for name, fields := range pm {
+				for _, k := range legacyKeys {
+					if _, ok := fields[k]; ok {
+						hits = append(hits, fmt.Sprintf("profiles.%s.%s → pools.<池名>.vpsctl.%s", name, k, k))
+					}
+				}
+			}
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+	return fmt.Errorf("检测到 %d 处旧字段，请按 docs/PROVIDER-ABSTRACTION.md §3.3 迁移：\n  - %s\n迁移要点：DO 建机参数（bin/accounts_file/account/region/size/image/snapshot）移入 pools.<池名>.vpsctl 子对象并补 hourly_cost_hint；profile 只留 pools/labels/runners_per_droplet（profile.pools 长度当前必须为 1）",
+		len(hits), strings.Join(hits, "\n  - "))
+}
+
 func (c *Config) validate() error {
+	if c.StateDir == "" {
+		return fmt.Errorf("state_dir：必填（状态与 cloud-init 落盘的根目录）")
+	}
+	if len(c.Pools) == 0 {
+		return fmt.Errorf("pools：至少配置一个机器池")
+	}
+	for name, p := range c.Pools {
+		if name == "" {
+			return fmt.Errorf("pools：池名不能为空")
+		}
+		if p.Provider == "" {
+			return fmt.Errorf("pools.%s.provider：必填（已注册：%v）", name, machine.Registered())
+		}
+		if p.MaxMachines < 1 {
+			return fmt.Errorf("pools.%s.max_machines：必须 ≥1", name)
+		}
+		// 用注册的 Factory 试构造一次：私有配置齐全性由实现校验（启动期报错）
+		if _, err := machine.New(p.Provider, name, p.Raw, machine.Env{StateDir: c.StateDir}); err != nil {
+			return err
+		}
+	}
 	if len(c.Repos) == 0 {
 		return fmt.Errorf("repos：至少配置一个仓（owner/name）")
 	}
@@ -113,20 +226,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("profiles：至少配置一个 profile")
 	}
 	for name, p := range c.Profiles {
-		if p.Account == "" {
-			return fmt.Errorf("profiles.%s.account：必填（vpsctl -only 钉账号，防全账号误建）", name)
+		if len(p.Pools) == 0 {
+			return fmt.Errorf("profiles.%s.pools：至少挂 1 个池", name)
 		}
-		if p.Region == "" {
-			return fmt.Errorf("profiles.%s.region：必填", name)
+		if len(p.Pools) > 1 {
+			return fmt.Errorf("profiles.%s.pools：长度 %d——多池调度尚未实现（schema 预留，当前只能挂 1 个池）", name, len(p.Pools))
 		}
-		if !regionRe.MatchString(p.Region) {
-			return fmt.Errorf("profiles.%s.region：%q 不是 DO region slug 形式", name, p.Region)
-		}
-		if p.Size == "" {
-			return fmt.Errorf("profiles.%s.size：必填", name)
-		}
-		if p.Image == "" {
-			return fmt.Errorf("profiles.%s.image：必填", name)
+		for i, pn := range p.Pools {
+			if _, ok := c.Pools[pn]; !ok {
+				return fmt.Errorf("profiles.%s.pools[%d]：%q 不存在于 pools", name, i, pn)
+			}
 		}
 		for i, l := range p.Labels {
 			if !labelRe.MatchString(l) {
@@ -139,11 +248,6 @@ func (c *Config) validate() error {
 		}
 		if p.RunnersPerDroplet < 1 || p.RunnersPerDroplet > 2 {
 			return fmt.Errorf("profiles.%s.runners_per_droplet：取值 1~2（2 为实验特性）", name)
-		}
-		for i, r := range p.FallbackRegions {
-			if !regionRe.MatchString(r) {
-				return fmt.Errorf("profiles.%s.fallback_regions[%d]：%q 不是 DO region slug 形式", name, i, r)
-			}
 		}
 	}
 	seen := map[string]bool{}
@@ -169,8 +273,8 @@ func (c *Config) validate() error {
 			maxRunners = r.MaxRunners
 		}
 	}
-	if c.Global.MaxDroplets < maxRunners {
-		return fmt.Errorf("global.max_droplets（%d）：必须 ≥ 任一仓的 max_runners（最大 %d）", c.Global.MaxDroplets, maxRunners)
+	if c.Global.MaxMachines < maxRunners {
+		return fmt.Errorf("global.max_machines（%d）：必须 ≥ 任一仓的 max_runners（最大 %d）", c.Global.MaxMachines, maxRunners)
 	}
 	if c.Global.DailyBudgetUSD <= 0 {
 		return fmt.Errorf("global.daily_budget_usd：必须 >0（钱有硬上限，§2.2 原则 10）")
@@ -181,6 +285,14 @@ func (c *Config) validate() error {
 // ProfileOf 返回仓对应的 profile（Load 已校验存在；找不到返回零值）。
 func (c *Config) ProfileOf(r RepoEntry) Profile {
 	return c.Profiles[r.Profile]
+}
+
+// PoolNameOf 返回 profile 用的池名（校验强制长度 1）。
+func (c *Config) PoolNameOf(p Profile) string {
+	if len(p.Pools) == 0 {
+		return ""
+	}
+	return p.Pools[0]
 }
 
 // sanitize 归一化为 tag/名字安全片段：小写、非 [a-z0-9] 替换 -、截断到 max。
@@ -207,7 +319,7 @@ func sha256Prefix(s string, n int) string {
 	return hex.EncodeToString(sum[:])[:n]
 }
 
-// Tag 返回仓的 droplet tag（§3.5：ciorch-r-<owner>-<name>-<sha256 前 8 位>，
+// Tag 返回仓的机器归属标记（§3.5：ciorch-r-<owner>-<name>-<sha256 前 8 位>，
 // sanitize 后总长 ≤64——用 owner/name 各截一段保证）。
 func (r RepoEntry) Tag() string {
 	parts := strings.SplitN(r.Repo, "/", 2)
@@ -216,16 +328,11 @@ func (r RepoEntry) Tag() string {
 	return fmt.Sprintf("ciorch-r-%s-%s-%s", owner, name, sum)
 }
 
-// NamePrefix 返回 droplet 名前缀（vpsctl -name-prefix）：ci-<sanitize(name) 截 20>。
+// NamePrefix 返回机器名前缀（vpsctl -name-prefix）：ci-<sanitize(name) 截 20>。
+// 命名格式的其余部分由池的 Namer 决定（§3.2）。
 func (r RepoEntry) NamePrefix() string {
 	parts := strings.SplitN(r.Repo, "/", 2)
 	return "ci-" + sanitize(parts[1], 20)
-}
-
-// NamespaceRe 返回本仓命名空间正则（droplet/runner 名 = {prefix}-{account}-
-// {region}-NN；命名空间外绝不触碰，§3.5 归属判定）。
-func (r RepoEntry) NamespacePattern(p Profile) string {
-	return fmt.Sprintf(`^%s-%s-%s-\d{2}$`, regexp.QuoteMeta(r.NamePrefix()), regexp.QuoteMeta(p.Account), regexp.QuoteMeta(p.Region))
 }
 
 // ResolveToken 按优先级解析 GitHub token：显式参数 > 环境变量 CIORCH_TOKEN >

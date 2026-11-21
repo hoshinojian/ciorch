@@ -102,10 +102,10 @@ func testCfg(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
 		StateDir:          t.TempDir(),
-		Global:            config.GlobalCfg{MaxDroplets: 2, DailyBudgetUSD: 5},
+		Global:            config.GlobalCfg{MaxMachines: 2, DailyBudgetUSD: 5},
 		SSHPublicKeyFiles: []string{},
 		Profiles: map[string]config.Profile{
-			"go-heavy": {Account: "team2-ci", Region: "sgp1", Size: "c2-4vcpu-8gb", Image: "ubuntu-24-04-x64", Labels: []string{"ci"}, RunnersPerDroplet: 1},
+			"go-heavy": {Pools: []string{"go-heavy"}, Labels: []string{"ci"}, RunnersPerDroplet: 1},
 		},
 		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
 	}
@@ -122,7 +122,9 @@ func newFakePool() *machinetest.Fake {
 func newEngine(t *testing.T, gh *fakeGH, pool *machinetest.Fake, obsrv Observer) *Engine {
 	t.Helper()
 	providers := map[string]machine.Provider{"go-heavy": pool}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := New(testCfg(t), gh, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(obsrv)
 	return e
@@ -304,7 +306,9 @@ func TestConcurrentReposNoRace(t *testing.T) {
 		Jobs:     []observe.Job{{ID: 1, RunID: 1, Status: "in_progress", CreatedAt: tnow.Add(-20 * time.Minute), StartedAt: tnow.Add(-20 * time.Minute), RunnerName: mname}},
 	}}
 	pool := newFakePool()
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return pool }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: pool}
+	}
 	e := New(cfg, &fakeGH{}, map[string]machine.Provider{"go-heavy": pool}, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(obsrv)
 	var wg sync.WaitGroup
@@ -334,12 +338,15 @@ func TestGateSingleSlotTwoRepos(t *testing.T) {
 	// 全局已有 1 台（max=2，剩 1 名额）；list 反映 create/delete
 	cl := &cluster{}
 	cl.seed(machine.Machine{Pool: "go-heavy", ID: "9", Name: "ci-x-team2-ci-sgp1-01", HourlyCost: 141.0 / 672.0, Tags: []string{"ciorch"}})
-	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
-	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
+	b := &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 100}
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl},
+		map[string]int{"go-heavy": 2}, map[string]float64{"go-heavy": 141.0 / 672.0})
 	gate.Now = func() time.Time { return tnow }
 
 	providers := map[string]machine.Provider{"go-heavy": cl}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	// 两仓并发各跑一轮（每仓 Q=3 会想建 2 台；全局只剩 1 名额）
@@ -368,13 +375,16 @@ func TestGateBudgetDenialIncidentF(t *testing.T) {
 	// 已有机器花掉了预算：1 台 141/672×2h≈0.42，日预算 0.5 → 新机 1 小时 0.21 会超
 	cl := &cluster{}
 	cl.seed(machine.Machine{Pool: "go-heavy", ID: "9", Name: "ci-x-team2-ci-sgp1-01", HourlyCost: 141.0 / 672.0, CreatedAt: tnow.Add(-2 * time.Hour), Tags: []string{"ciorch"}})
-	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 0.5}
-	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
+	b := &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 0.5}
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl},
+		map[string]int{"go-heavy": 2}, map[string]float64{"go-heavy": 141.0 / 672.0})
 	gate.Now = func() time.Time { return tnow }
 
 	incidents := []decide.Action{}
 	providers := map[string]machine.Provider{"go-heavy": cl}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	e.OnIncident = func(ctx context.Context, repo string, a decide.Action) { incidents = append(incidents, a) }
@@ -393,15 +403,18 @@ func TestGateBudgetDenialIncidentF(t *testing.T) {
 func TestDrainRecordsDeletionToBudget(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	cl := &cluster{}
-	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
-	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
+	b := &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 100}
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl},
+		map[string]int{"go-heavy": 2}, map[string]float64{"go-heavy": 141.0 / 672.0})
 	gate.Now = func() time.Time { return tnow }
 
 	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
 	providers := map[string]machine.Provider{"go-heavy": cl}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := New(testCfg(t), &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	e.SetCollector(&fakeObs{o})
@@ -481,7 +494,9 @@ func TestDrainWithoutRegistrationDeletesDirectly(t *testing.T) {
 	// 无任何注册（Runners 空 → decide 的 Drain 带 RunnerID=0）
 	cl := &cluster{}
 	providers := map[string]machine.Provider{"go-heavy": cl}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := New(testCfg(t), &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(&fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(nil, name)
@@ -517,7 +532,7 @@ func TestReconcileReturnsStats(t *testing.T) {
 // §6（实施计划）：两个池时建机/删机路由到正确的 provider、孤儿扫描覆盖所有池。
 func TestTwoPoolsRouteToProviders(t *testing.T) {
 	cfg := testCfg(t)
-	cfg.Profiles["go-light"] = config.Profile{Account: "team2-ci", Region: "sgp1", Size: "s-1vcpu-2gb", Image: "ubuntu-24-04-x64", Labels: []string{"ci"}, RunnersPerDroplet: 1}
+	cfg.Profiles["go-light"] = config.Profile{Pools: []string{"go-light"}, Labels: []string{"ci"}, RunnersPerDroplet: 1}
 	cfg.Repos = []config.RepoEntry{
 		{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2},
 		{Repo: "hoshinojian/web", Profile: "go-light", MaxRunners: 2},
@@ -525,7 +540,9 @@ func TestTwoPoolsRouteToProviders(t *testing.T) {
 	poolHeavy, poolLight := newFakePool(), newFakePool()
 	poolLight.Pool = "go-light"
 	providers := map[string]machine.Provider{"go-heavy": poolHeavy, "go-light": poolLight}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: r.Profile, Provider: providers[r.Profile]}
+	}
 
 	// nms 建机 → go-heavy；web 建机 → go-light
 	oNms := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}

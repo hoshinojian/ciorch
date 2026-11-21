@@ -64,11 +64,11 @@ func newFakePool() *fakePool {
 func repo1() config.RepoEntry { return config.RepoEntry{Repo: "hoshinojian/nms", Profile: "go-heavy"} }
 
 func prof() config.Profile {
-	return config.Profile{Account: "team2-ci", Region: "sgp1", Labels: []string{"ci"}, RunnersPerDroplet: 1}
+	return config.Profile{Pools: []string{"go-heavy"}, Labels: []string{"ci"}, RunnersPerDroplet: 1}
 }
 
 func collector(gh *fakeGH, pool *fakePool, cache *JobCache) *Collector {
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return pool }
+	poolOf := func(r config.RepoEntry, p config.Profile) Pool { return Pool{Name: "go-heavy", Provider: pool} }
 	return &Collector{GH: gh, PoolOf: poolOf, Cache: cache, Now: func() time.Time { return now }}
 }
 

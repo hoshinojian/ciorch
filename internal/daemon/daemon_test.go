@@ -22,15 +22,15 @@ func testDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	cfg := &config.Config{
 		StateDir: t.TempDir(),
-		Global:   config.GlobalCfg{MaxDroplets: 2, DailyBudgetUSD: 5},
+		Global:   config.GlobalCfg{MaxMachines: 2, DailyBudgetUSD: 5},
 		Profiles: map[string]config.Profile{
-			"go-heavy": {Account: "team2-ci", Region: "sgp1", RunnersPerDroplet: 1},
+			"go-heavy": {Pools: []string{"go-heavy"}, RunnersPerDroplet: 1},
 		},
 		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
 	}
 	// 本文件只测间隔切换/触发合并/摘要，不触 IO 面——接口传 nil。
 	e := engine.New(cfg, nil, nil, nil, nil, nil, log.New(io.Discard, "", 0))
-	return New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
+	return New(cfg, e, &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 }
 
 // 间隔切换（§3.6.6）：空闲 → poll_idle；冷启在途/在忙/补救中 → poll_active。
@@ -127,17 +127,19 @@ func TestDaemonDryRunZeroWrites(t *testing.T) {
 	ssh := &recSSH{}
 	cfg := &config.Config{
 		StateDir: t.TempDir(),
-		Global:   config.GlobalCfg{MaxDroplets: 2, DailyBudgetUSD: 5},
+		Global:   config.GlobalCfg{MaxMachines: 2, DailyBudgetUSD: 5},
 		Profiles: map[string]config.Profile{
-			"go-heavy": {Account: "team2-ci", Region: "sgp1", RunnersPerDroplet: 1},
+			"go-heavy": {Pools: []string{"go-heavy"}, RunnersPerDroplet: 1},
 		},
 		Repos: []config.RepoEntry{{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}},
 	}
 	providers := map[string]machine.Provider{"go-heavy": pool}
-	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
 	e := engine.New(cfg, gh, providers, poolOf, ssh, nil, log.New(io.Discard, "", 0))
 	e.SetCollector(&fixedObs{o})
-	d := New(cfg, e, &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
+	d := New(cfg, e, &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 	d.DryRun = true
 	next := d.round(context.Background(), cfg.Repos[0], filepath.Join(cfg.StateDir, "state.json"))
 	if next != d.PollActive {

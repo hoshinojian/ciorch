@@ -63,3 +63,12 @@ type Namer interface {
 	// Pattern 只描述机器名，后缀匹配仍在 decide 里做。
 	Pattern(prefix string) string
 }
+
+// CostHinter 由能给"空池新建一台机器"估价的实现可选实现（§3.4 二选一：
+// 本项目选池配置 hourly_cost_hint 而非接口方法 EstimateHourlyCost，取舍
+// 理由见实施计划 PR ① 的 PR 描述；实现把配置值经此接口透出给预算层）。
+// 池里有机器时预算用最近一台机器的 HourlyCost，不用 hint。
+type CostHinter interface {
+	// HourlyCostHint 返回空池时新机每小时成本的保守估计（USD）。
+	HourlyCostHint() float64
+}

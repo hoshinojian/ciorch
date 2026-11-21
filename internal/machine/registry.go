@@ -9,10 +9,17 @@ import (
 	"sync"
 )
 
+// Env 是构造 Provider 时的运行时环境（提供商私有配置之外的部分）。
+type Env struct {
+	// StateDir 是编排器状态目录（cloud-init 落盘等持久化产物放它下面）。
+	StateDir string
+}
+
 // Factory 从池私有配置构造 Provider。raw 是池配置里与 provider 同名的
 // 子对象（只有对应实现解析，其余字段由 config 层拒绝）；pool 是池名，
-// 实现须把它写进 Machine.Pool。
-type Factory func(pool string, raw json.RawMessage) (Provider, error)
+// 实现须把它写进 Machine.Pool。工厂同时承担私有配置校验（config.Load
+// 会调用一次以在启动期报出配置错误）。
+type Factory func(pool string, raw json.RawMessage, env Env) (Provider, error)
 
 var (
 	regMu sync.RWMutex
@@ -30,14 +37,14 @@ func Register(kind string, f Factory) {
 }
 
 // New 按类型名构造 Provider（未注册的 kind 返回错误，配置校验依赖这一点）。
-func New(kind, pool string, raw json.RawMessage) (Provider, error) {
+func New(kind, pool string, raw json.RawMessage, env Env) (Provider, error) {
 	regMu.RLock()
 	f, ok := reg[kind]
 	regMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("未知 provider %q（已注册：%v）", kind, Registered())
 	}
-	return f(pool, raw)
+	return f(pool, raw, env)
 }
 
 // Registered 返回已注册的 provider 类型名（排序，错误信息/测试用）。

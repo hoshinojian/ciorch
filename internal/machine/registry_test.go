@@ -7,20 +7,20 @@ import (
 )
 
 // 测试用 fake factory（不依赖任何真实实现）。
-func fakeFactory(pool string, raw json.RawMessage) (Provider, error) {
+func fakeFactory(pool string, raw json.RawMessage, env Env) (Provider, error) {
 	return nil, nil
 }
 
 func TestRegisterAndNew(t *testing.T) {
 	Register("testprov", fakeFactory)
-	p, err := New("testprov", "pool-a", json.RawMessage(`{}`))
+	p, err := New("testprov", "pool-a", json.RawMessage(`{}`), Env{StateDir: "/tmp"})
 	if err != nil || p != nil {
 		t.Fatalf("New 应返回 factory 的结果：p=%v err=%v", p, err)
 	}
 }
 
 func TestNewUnknownKind(t *testing.T) {
-	_, err := New("no-such-prov", "pool-a", nil)
+	_, err := New("no-such-prov", "pool-a", nil, Env{})
 	if err == nil || !strings.Contains(err.Error(), "未知 provider") {
 		t.Fatalf("未注册 kind 应报错：err=%v", err)
 	}

@@ -59,9 +59,15 @@ type GHSource interface {
 	ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error)
 }
 
-// PoolOf 返回某仓所用池的 Provider（cmd 装配；测试注入 fake）。
-// profile→池的解析属装配层：过渡期池名 = profile 名，池化配置后 = profile.pools[0]。
-type PoolOf func(r config.RepoEntry, p config.Profile) machine.Provider
+// Pool 是一个仓所用的池：名字 + Provider（预算按池计数/容量/估价都要名字）。
+type Pool struct {
+	Name     string
+	Provider machine.Provider
+}
+
+// PoolOf 返回某仓所用池（cmd 装配；测试注入 fake）。profile→池的解析属装配层
+// （池化配置后 = profile.pools[0]，长度 1 由 config 校验强制）。
+type PoolOf func(r config.RepoEntry, p config.Profile) Pool
 
 // JobCacheEntry 是 webhook 送来的 job 快照（§3.4.5：只用于补齐 run 列表
 // 尚未反映的刚出现 job；条目 2 小时过期，同 job id 以 updated 更新者为准）。
@@ -197,7 +203,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 		}
 	}
 
-	machines, err := c.PoolOf(r, p).List(ctx, r.Tag())
+	machines, err := c.PoolOf(r, p).Provider.List(ctx, r.Tag())
 	if err != nil {
 		fail(err, &obs.MachinesOK)
 	} else {
