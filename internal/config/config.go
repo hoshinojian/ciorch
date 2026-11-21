@@ -200,6 +200,12 @@ func checkLegacyFields(raw []byte) error {
 }
 
 func (c *Config) validate() error {
+	// 认证源二选一（§3.4.2）：GitHub App 与 PAT token_file 同时配置即错
+	appCfg := c.GitHubApp.AppID != 0 || c.GitHubApp.PrivateKeyFile != ""
+	if appCfg && c.TokenFile != "" {
+		return fmt.Errorf("github_app 与 token_file 只能二选一（App 为生产路径，token_file 为开发备选）")
+	}
+
 	if c.StateDir == "" {
 		return fmt.Errorf("state_dir：必填（状态与 cloud-init 落盘的根目录）")
 	}

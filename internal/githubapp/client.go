@@ -26,7 +26,8 @@ const defaultBaseURL = "https://api.github.com"
 // Client 是 GitHub REST 客户端。
 type Client struct {
 	baseURL   string
-	token     string
+	token     string // PAT 路径（App 路径为空，认证走 app）
+	app       *AppAuth
 	http      *http.Client
 	userAgent string
 
@@ -123,6 +124,31 @@ func WithSleeper(f func(ctx context.Context, d time.Duration) error) Option {
 	return func(c *Client) { c.sleep = f }
 }
 
+// NewAppClient 构造 GitHub App 认证客户端（每请求按仓取 installation
+// token；401 作废重取一次）。
+func NewAppClient(app *AppAuth, opts ...Option) *Client {
+	c := &Client{
+		baseURL:   defaultBaseURL,
+		app:       app,
+		http:      &http.Client{Timeout: 15 * time.Second},
+		userAgent: "ciorch",
+		bo:        []time.Duration{500 * time.Millisecond, 1500 * time.Millisecond},
+		etags:     map[string]etagEntry{},
+	}
+	c.sleep = func(ctx context.Context, d time.Duration) error {
+		select {
+		case <-time.After(d):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
 // NewClient 构造客户端（token 必填，来源解析在 internal/config.ResolveToken）。
 func NewClient(token string, opts ...Option) *Client {
 	c := &Client{
@@ -158,12 +184,16 @@ func (c *Client) RateRemaining() int {
 
 // fetch 是带重试/ETag/限流的 GET（§3.4.3）。返回 body 与 Link rel="next"
 // （304 时用缓存，含缓存的 link）。
-func (c *Client) fetch(ctx context.Context, path, fullURL string) ([]byte, string, error) {
+func (c *Client) fetch(ctx context.Context, repo, path, fullURL string) ([]byte, string, error) {
 	if fullURL == "" {
 		fullURL = c.baseURL + "/" + path
 	}
 	backoff := append([]time.Duration(nil), c.bo...)
 	cached := c.etags[fullURL]
+	token, terr := c.auth(ctx, repo)
+	if terr != nil {
+		return nil, "", fmt.Errorf("取认证 token: %w", terr)
+	}
 
 	type result struct {
 		body    []byte
@@ -175,7 +205,7 @@ func (c *Client) fetch(ctx context.Context, path, fullURL string) ([]byte, strin
 		if err != nil {
 			return result{noRetry: true}, true, err
 		}
-		c.setHeaders(req)
+		c.setHeaders(req, token)
 		if cached.etag != "" {
 			req.Header.Set("If-None-Match", cached.etag)
 		}
@@ -202,6 +232,14 @@ func (c *Client) fetch(ctx context.Context, path, fullURL string) ([]byte, strin
 		}
 		if resp.StatusCode >= 500 {
 			return result{}, false, fmt.Errorf("HTTP %d", resp.StatusCode) // 可重试
+		}
+		if resp.StatusCode == http.StatusUnauthorized && c.app != nil {
+			// §3.4.2：收到 401 立即作废该仓 token，重取一次（退避后重试）
+			c.app.Invalidate(repo)
+			if nt, nerr := c.auth(ctx, repo); nerr == nil {
+				token = nt
+			}
+			return result{}, false, fmt.Errorf("401（已作废重取，将重试）")
 		}
 		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 			// 403/429 带 Retry-After：遵守后重试一次
@@ -332,7 +370,7 @@ func (c *Client) ListRuns(ctx context.Context, repo string, since time.Time) ([]
 	q := url.Values{}
 	q.Set("per_page", "100")
 	q.Set("created", ">="+since.UTC().Format(time.RFC3339))
-	err := c.paginate(ctx, fmt.Sprintf("repos/%s/actions/runs", repo), q, func(body json.RawMessage) error {
+	err := c.paginate(ctx, repo, fmt.Sprintf("repos/%s/actions/runs", repo), q, func(body json.RawMessage) error {
 		var page struct {
 			WorkflowRuns []Run `json:"workflow_runs"`
 		}
@@ -361,7 +399,7 @@ func (c *Client) ListJobs(ctx context.Context, repo string, runID int64) ([]Job,
 	q := url.Values{}
 	q.Set("per_page", "100")
 	q.Set("filter", "latest")
-	err := c.paginate(ctx, fmt.Sprintf("repos/%s/actions/runs/%d/jobs", repo, runID), q, func(body json.RawMessage) error {
+	err := c.paginate(ctx, repo, fmt.Sprintf("repos/%s/actions/runs/%d/jobs", repo, runID), q, func(body json.RawMessage) error {
 		var page struct {
 			Jobs []Job `json:"jobs"`
 		}
@@ -382,7 +420,7 @@ func (c *Client) MintToken(ctx context.Context, repo string) (string, error) {
 	var out struct {
 		Token string `json:"token"`
 	}
-	if err := c.do(ctx, http.MethodPost, fmt.Sprintf("repos/%s/actions/runners/registration-token", repo), &out); err != nil {
+	if err := c.do(ctx, repo, http.MethodPost, fmt.Sprintf("repos/%s/actions/runners/registration-token", repo), &out); err != nil {
 		return "", fmt.Errorf("铸 registration token: %w", err)
 	}
 	if len(out.Token) < 16 {
@@ -393,39 +431,61 @@ func (c *Client) MintToken(ctx context.Context, repo string) (string, error) {
 
 // RemoveRunner 删除 runner 注册（Drain 第一步/清残留，§3.8）。
 func (c *Client) RemoveRunner(ctx context.Context, repo string, runnerID int64) error {
-	return c.do(ctx, http.MethodDelete, fmt.Sprintf("repos/%s/actions/runners/%d", repo, runnerID), nil)
+	return c.do(ctx, repo, http.MethodDelete, fmt.Sprintf("repos/%s/actions/runners/%d", repo, runnerID), nil)
 }
 
-// do 是非 GET 端点的薄封装（无分页）。
-func (c *Client) do(ctx context.Context, method, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/"+path, nil)
-	if err != nil {
-		return err
+// do 是非 GET 端点的薄封装（无分页；App 路径 401 作废重取一次）。
+func (c *Client) do(ctx context.Context, repo, method, path string, out any) error {
+	token, terr := c.auth(ctx, repo)
+	if terr != nil {
+		return fmt.Errorf("取认证 token: %w", terr)
 	}
-	c.setHeaders(req)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+	var body []byte
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/"+path, nil)
+		if err != nil {
+			return err
+		}
+		c.setHeaders(req, token)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", method, path, err)
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			return rerr
+		}
+		if resp.StatusCode == http.StatusUnauthorized && c.app != nil && attempt == 0 {
+			// §3.4.2：401 立即作废该仓 token，重取一次
+			c.app.Invalidate(repo)
+			if nt, nerr := c.auth(ctx, repo); nerr == nil {
+				token = nt
+				continue
+			}
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
+			return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
+		}
+		body = raw
+		break
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
-	}
-	if out == nil {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if len(body) == 0 {
+	if out == nil || len(body) == 0 {
 		return nil
 	}
 	return json.Unmarshal(body, out)
 }
 
-func (c *Client) setHeaders(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.token)
+// auth 取该仓的认证 token（App 路径按仓铸 installation token；PAT 直接用）。
+func (c *Client) auth(ctx context.Context, repo string) (string, error) {
+	if c.app != nil {
+		return c.app.Token(ctx, repo)
+	}
+	return c.token, nil
+}
+
+func (c *Client) setHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", c.userAgent)
@@ -436,7 +496,7 @@ func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error)
 	var out []Runner
 	q := url.Values{}
 	q.Set("per_page", "100")
-	err := c.paginate(ctx, fmt.Sprintf("repos/%s/actions/runners", repo), q, func(body json.RawMessage) error {
+	err := c.paginate(ctx, repo, fmt.Sprintf("repos/%s/actions/runners", repo), q, func(body json.RawMessage) error {
 		var page struct {
 			Runners []Runner `json:"runners"`
 		}
@@ -454,10 +514,10 @@ func (c *Client) ListRunners(ctx context.Context, repo string) ([]Runner, error)
 
 // paginate 逐页请求并回调解析，跟随 Link rel="next"（上限 20 页防御）。
 // 请求统一走 fetch（§3.4.3 重试/ETag/限流）。
-func (c *Client) paginate(ctx context.Context, path string, q url.Values, parse func(json.RawMessage) error) error {
+func (c *Client) paginate(ctx context.Context, repo string, path string, q url.Values, parse func(json.RawMessage) error) error {
 	next := c.baseURL + "/" + path + "?" + q.Encode()
 	for i := 0; i < 20 && next != ""; i++ {
-		body, link, err := c.fetch(ctx, path, next)
+		body, link, err := c.fetch(ctx, repo, path, next)
 		if err != nil {
 			return err
 		}
