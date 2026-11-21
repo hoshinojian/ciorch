@@ -132,13 +132,27 @@ type runtime struct {
 // Provider（vpsctl 实现经 init 注册），profile→池解析 = profile.pools[0]
 // （长度 1 由 config 校验强制）。
 func wiring(cfg *config.Config, token string) (*runtime, error) {
-	tok, err := config.ResolveToken(cfg, token, func() (string, error) {
-		return githubapp.GHToken(context.Background(), "gh", nil)
-	})
-	if err != nil {
-		return nil, err
+	rt := &runtime{}
+	if cfg.GitHubApp.AppID != 0 && cfg.GitHubApp.PrivateKeyFile != "" {
+		// GitHub App 生产路径（§3.4.2）：私钥 PEM 加载，按仓铸 installation token
+		pem, err := os.ReadFile(cfg.GitHubApp.PrivateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("读 App 私钥: %w", err)
+		}
+		key, err := githubapp.ParseRSAPrivateKeyFromPEM(pem)
+		if err != nil {
+			return nil, fmt.Errorf("解析 App 私钥（应为 PKCS#1/PKCS#8 PEM）: %w", err)
+		}
+		rt.gh = githubapp.NewAppClient(githubapp.NewAppAuth(cfg.GitHubApp.AppID, key))
+	} else {
+		tok, err := config.ResolveToken(cfg, token, func() (string, error) {
+			return githubapp.GHToken(context.Background(), "gh", nil)
+		})
+		if err != nil {
+			return nil, err
+		}
+		rt.gh = githubapp.NewClient(tok)
 	}
-	rt := &runtime{gh: githubapp.NewClient(tok)}
 	rt.providers = map[string]machine.Provider{}
 	rt.poolCaps = map[string]int{}
 	rt.hints = map[string]float64{}

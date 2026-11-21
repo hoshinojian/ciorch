@@ -219,3 +219,29 @@ func TestResolveTokenNothingAvailable(t *testing.T) {
 		t.Fatal("无任何 token 源应报错")
 	}
 }
+
+// 认证源互斥（§3.4.2）：github_app 与 token_file 同时配置报错。
+func TestAuthSourceMutualExclusion(t *testing.T) {
+	p := validCfgWithToken()
+	if _, err := Load(write(t, p)); err != nil {
+		t.Fatalf("单 token_file 应通过: %v", err)
+	}
+	app := validCfgWithApp()
+	if _, err := Load(write(t, app)); err != nil {
+		t.Fatalf("单 github_app 应通过: %v", err)
+	}
+	both := validCfgWithApp()
+	both = strings.Replace(both, `"state_dir"`, "\"token_file\": \"/tmp/t\",\n  \"state_dir\"", 1)
+	if _, err := Load(write(t, both)); err == nil || !strings.Contains(err.Error(), "二选一") {
+		t.Fatalf("同时配置应报错: %v", err)
+	}
+}
+
+func validCfgWithToken() string {
+	return strings.Replace(validCfg, `"state_dir"`, "\"token_file\": \"/tmp/tok\",\n  \"state_dir\"", 1)
+}
+
+func validCfgWithApp() string {
+	return strings.Replace(validCfg, `"state_dir"`,
+		"\"github_app\": {\"app_id\": 123456, \"private_key_file\": \"/etc/ciorch/app.pem\", \"webhook_secret_file\": \"/etc/ciorch/webhook.secret\"},\n  \"state_dir\"", 1)
+}
