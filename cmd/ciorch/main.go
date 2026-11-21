@@ -158,7 +158,7 @@ func wiring(cfg *config.Config, token string) (*runtime, error) {
 		return observe.Pool{Name: pn, Provider: rt.providers[pn]}
 	}
 	rt.collector = &observe.Collector{GH: rt.gh, PoolOf: rt.poolOf}
-	rt.engine = engine.New(cfg, rt.gh, rt.providers, rt.poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, nil, log.Default())
+	rt.engine = engine.New(cfg, rt.gh, rt.providers, rt.poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, engine.CloudInitRenderer{Agent: cfg.MachineAgent}, log.Default())
 	rt.engine.SetCollector(rt.collector)
 	return rt, nil
 }

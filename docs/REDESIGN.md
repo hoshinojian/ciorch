@@ -214,7 +214,8 @@ docs/                  本设计的副本 + runbook
     "go-heavy": {
       "pools": ["do-sgp1-c2"],
       "labels": ["ci"],
-      "runners_per_droplet": 1
+      "runners_per_droplet": 1,
+      "extra_packages": []
     }
   },
   "repos": [
@@ -235,6 +236,7 @@ docs/                  本设计的副本 + runbook
 - `global.max_machines` ≥ 任一仓的 `max_runners`；`Σ 池容量` 与全局上限的关系不强制；`state_dir` 必填。
 - `labels`：`^[A-Za-z0-9_-]+$`；`self-hosted`、`linux`、`x64` 为注册自动标签，不必写。
 - `runners_per_droplet` 默认 1，取值 1~2（2 为实验特性，§3.6.4）。
+- `extra_packages` 底座五包（docker.io/jq/curl/build-essential/shellcheck）之外追加的包（§5.3 坑 10；渲染器接入时新增，2026-11-21）。
 - `issue_repo` 空 = 在 `repo` 本身开 issue；非空 = 改投到指定仓（给不想在本仓开 issue 的项目用）。
 - vpsctl 池私有配置：`bin/accounts_file/account/region/size/image` 必填（`account` 钉 vpsctl `-only`，防全账号误建——2026-11-13 教训）；`snapshot` 非空时建机用它替代 image（阶段 7）；`prefer_private_ip` 缺省 true；`hourly_cost_hint` **必须 >0**（空池建机的预算投影不能当 0，§3.7）。
 - 对 nms：**必须保持 c2-4vcpu-8gb / sgp1**（专用核：共享核两次击穿 `-race` 时敏用例；同规格同区避免覆盖率基线重校，nms 决策 #148）。
