@@ -19,20 +19,23 @@ type listFailer interface {
 }
 
 // Run 对一个新构造的 Provider 跑全部契约用例。new 每次返回一个干净实例。
+// 建机名一律取自 p.Namer().Next（引擎的真实用法：名字由 ciorch 经命名规则
+// 定好、提供商必须原样使用——各实现的命名格式不同，套件不写死名字）。
 func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 	t.Helper()
 	t.Run("CreateEchoesNameAndTags", func(t *testing.T) {
 		p := new(t)
 		ctx := context.Background()
+		name := p.Namer().Next("ci-demo", nil)
 		m, err := p.Create(ctx, machine.CreateRequest{
-			Name: "ci-demo-01", Tags: []string{"ciorch", "ciorch-r-demo"},
+			Name: name, Tags: []string{"ciorch", "ciorch-r-demo"},
 			UserData: []byte("#cloud-config\n"),
 		})
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		if m.Name != "ci-demo-01" {
-			t.Fatalf("名字必须原样返回：got %q", m.Name)
+		if m.Name != name {
+			t.Fatalf("名字必须原样返回：got %q want %q", m.Name, name)
 		}
 		if m.ID == "" {
 			t.Fatal("返回的 Machine 必须带 ID")
@@ -44,7 +47,7 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 		if err != nil {
 			t.Fatalf("List: %v", err)
 		}
-		if len(ms) != 1 || ms[0].Name != "ci-demo-01" || ms[0].ID != m.ID {
+		if len(ms) != 1 || ms[0].Name != name || ms[0].ID != m.ID {
 			t.Fatalf("建机后应能按标记列出且名字原样：%+v", ms)
 		}
 		if ms[0].Pool == "" {
@@ -54,7 +57,7 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 	t.Run("ListFiltersByTag", func(t *testing.T) {
 		p := new(t)
 		ctx := context.Background()
-		if _, err := p.Create(ctx, machine.CreateRequest{Name: "ci-demo-01", Tags: []string{"ciorch", "ciorch-r-demo"}}); err != nil {
+		if _, err := p.Create(ctx, machine.CreateRequest{Name: p.Namer().Next("ci-demo", nil), Tags: []string{"ciorch", "ciorch-r-demo"}, UserData: []byte("#cloud-config\n")}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
 		ms, err := p.List(ctx, "ciorch-r-other")
@@ -68,7 +71,7 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 	t.Run("DeleteRemovesFromList", func(t *testing.T) {
 		p := new(t)
 		ctx := context.Background()
-		m, err := p.Create(ctx, machine.CreateRequest{Name: "ci-demo-01", Tags: []string{"ciorch"}})
+		m, err := p.Create(ctx, machine.CreateRequest{Name: p.Namer().Next("ci-demo", nil), Tags: []string{"ciorch"}, UserData: []byte("#cloud-config\n")})
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -86,7 +89,7 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 	t.Run("DeleteIdempotent", func(t *testing.T) {
 		p := new(t)
 		ctx := context.Background()
-		m, err := p.Create(ctx, machine.CreateRequest{Name: "ci-demo-01", Tags: []string{"ciorch"}})
+		m, err := p.Create(ctx, machine.CreateRequest{Name: p.Namer().Next("ci-demo", nil), Tags: []string{"ciorch"}, UserData: []byte("#cloud-config\n")})
 		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -104,7 +107,7 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 			t.Skipf("%T 不支持失败注入（未实现 FailNextList），跳过部分失败用例", p)
 		}
 		ctx := context.Background()
-		if _, err := p.Create(ctx, machine.CreateRequest{Name: "ci-demo-01", Tags: []string{"ciorch"}}); err != nil {
+		if _, err := p.Create(ctx, machine.CreateRequest{Name: p.Namer().Next("ci-demo", nil), Tags: []string{"ciorch"}, UserData: []byte("#cloud-config\n")}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
 		inj.FailNextList()
@@ -121,8 +124,9 @@ func Run(t *testing.T, new func(t *testing.T) machine.Provider) {
 			go func(g int) {
 				defer wg.Done()
 				for i := 0; i < 5; i++ {
-					name := fmt.Sprintf("ci-demo-%02d-%02d", g, i)
-					if _, err := p.Create(ctx, machine.CreateRequest{Name: name, Tags: []string{"ciorch"}}); err != nil {
+					// 前缀全局唯一（各实现的命名格式不同，名字经 Namer 取）
+					name := p.Namer().Next(fmt.Sprintf("ci-g%d-%02d", g, i), nil)
+					if _, err := p.Create(ctx, machine.CreateRequest{Name: name, Tags: []string{"ciorch"}, UserData: []byte("#cloud-config\n")}); err != nil {
 						t.Errorf("并发 Create: %v", err)
 						return
 					}
