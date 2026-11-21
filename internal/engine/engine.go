@@ -155,6 +155,10 @@ func (e *Engine) Reconcile(ctx context.Context, repo config.RepoEntry, dryRun bo
 		// 命名空间由池的 Namer 给出（vpsctl：{prefix}-{account}-{region}-NN）
 		OwnedRunnerRe: regexp.MustCompile(pool.Provider.Namer().Pattern(repo.NamePrefix())),
 	}
+	// global.tuning 覆盖决策阈值（§3.6.6）；非法配置启动首轮即报错
+	if err := params.ApplyTuning(e.Cfg.Global.Tuning); err != nil {
+		return nil, RoundStats{}, fmt.Errorf("仓 %s: %w", repo.Repo, err)
+	}
 	e.mu.Lock()
 	state := e.States[repo.Repo]
 	e.mu.Unlock()
