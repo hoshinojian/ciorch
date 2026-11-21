@@ -28,8 +28,10 @@ gh run list --repo hoshinojian/ciorch-sandbox --workflow smoke --limit 1
 - 编排器日志秒级出现 `Q=7`（7 个 job）与 `actions=[create,create]`
   （Q=7 > 一台容量，建满 `max_runners`）。
 - ~3 分钟内（冷启实测 ~2.5m）首个 job 开跑（GitHub 侧 job 转 in_progress）。
-- 全部 job 跑完（最长 600s 的 long-sleep）后 **20 分钟空闲**（此后无新
+- 全部 job 跑完（最长 600s 的 long-sleep）后进入空闲回收窗口（此后无新
   dispatch），编排器日志出现空闲回收 `drain` 动作，逐台删除；注册清干净。
+  空闲阈值是自适应的（§3.6.3）：近 2h 活跃点 ≥2 → `idle_timeout_busy`(45m)，
+  否则 20m——一轮刚干完活的机器实测走 45m（2026-11-21 冒烟）。
 
 **取证**：
 - 建机时刻：`journalctl -u ciorch | grep 已建机`（与 dispatch 时间差）。
@@ -49,7 +51,10 @@ ssh root@<runner-ip> 'systemctl stop actions.runner.*'
 ```
 
 **预期**：2 轮采样（~30s）后编排器判定场景 C：先建替换机（有配额时），
-强删旧机；剩余排队 job 被新机接走，run 最终 success。
+强删旧机；剩余**排队** job 被新机接走。注意（2026-11-21 实测）：强删时
+runner 上**进行中**的 job 不会被 GitHub 重排——该 job 以失败告终
+（step 显示 cancelled / runner lost communication），run 结论为 failure；
+只有"剩余排队 job 换 runner_name 跑完"这一半是 success。
 
 **取证**：
 - 编排器日志：`场景 C 掉线` 的 force-delete 动作行与其 Reason。
