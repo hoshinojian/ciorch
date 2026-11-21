@@ -181,6 +181,55 @@ func hasRemoveReg(acts []Action, name string) bool {
 }
 
 // 顺手修：LastActivity 按不同 RunID 记——同一 run 的多个 job 只算一次活动。
+// 跨轮形态（2026-11-21 冒烟实测的真实场景）：job 错峰开跑，每轮快照里该
+// run"最新开跑时刻"都不同——轮内 byRun 去重挡不住，同一 run 会每轮追加
+// 新点，单 run 就把自适应空闲顶到 45m 档（该函数复审修正要防的失效模式）。
+func TestLastActivityByRunIDAcrossRounds(t *testing.T) {
+	mk := func(o observe.Obs, jobs ...observe.Job) observe.Obs {
+		o.Jobs = jobs
+		return o
+	}
+	// 第 1 轮：run 100 只有 job A 在跑（started 10m 前）
+	st := RepoState{}
+	_, st1 := Decide(params(), st, mk(obs(), observe.Job{
+		ID: 1, RunID: 100, Status: "in_progress",
+		CreatedAt: t0.Add(-10 * time.Minute), StartedAt: t0.Add(-10 * time.Minute),
+	}))
+	if len(st1.LastActivity) != 1 {
+		t.Fatalf("第 1 轮应 1 个活动点，got %d：%v", len(st1.LastActivity), st1.LastActivity)
+	}
+	// 第 2 轮：同 run 100，job A 仍在跑 + job B 错峰开跑（started 5m 前）
+	_, st2 := Decide(params(), cloneState(st1), mk(obs(),
+		observe.Job{ID: 1, RunID: 100, Status: "in_progress",
+			CreatedAt: t0.Add(-10 * time.Minute), StartedAt: t0.Add(-10 * time.Minute)},
+		observe.Job{ID: 2, RunID: 100, Status: "in_progress",
+			CreatedAt: t0.Add(-5 * time.Minute), StartedAt: t0.Add(-5 * time.Minute)},
+	))
+	if len(st2.LastActivity) != 1 {
+		t.Fatalf("同 run 跨轮错峰开跑只记一次，got %d：%v", len(st2.LastActivity), st2.LastActivity)
+	}
+	// 第 3 轮：不同 run 200 → 累计 2 个点
+	_, st3 := Decide(params(), cloneState(st2), mk(obs(),
+		observe.Job{ID: 1, RunID: 100, Status: "in_progress",
+			CreatedAt: t0.Add(-10 * time.Minute), StartedAt: t0.Add(-10 * time.Minute)},
+		observe.Job{ID: 3, RunID: 200, Status: "in_progress",
+			CreatedAt: t0.Add(-5 * time.Minute), StartedAt: t0.Add(-5 * time.Minute)},
+	))
+	if len(st3.LastActivity) != 2 {
+		t.Fatalf("两个 run 应两个活动点，got %d：%v", len(st3.LastActivity), st3.LastActivity)
+	}
+	// RecordedRuns 随 2h 窗口淘汰（防 map 无界增长）：时间推到 3h 后再跑一轮
+	o := obs()
+	o.Now = t0.Add(3 * time.Hour)
+	o.Jobs = []observe.Job{{ID: 4, RunID: 300, Status: "in_progress",
+		CreatedAt: t0.Add(3 * time.Hour), StartedAt: t0.Add(3 * time.Hour)}}
+	_, st4 := Decide(params(), cloneState(st3), o)
+	if len(st4.RecordedRuns) != 1 {
+		t.Fatalf("出窗 RunID 应淘汰，RecordedRuns=%v", st4.RecordedRuns)
+	}
+}
+
+// 顺手修：LastActivity 按不同 RunID 记——同一 run 的多个 job 只算一次活动。
 func TestLastActivityByRunID(t *testing.T) {
 	o := obs()
 	// 一个 run 的 7 个 job 都在跑（同 RunID=100）
