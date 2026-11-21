@@ -21,7 +21,9 @@ import (
 	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
 	"github.com/hoshinojian/ciorch/internal/machine"
+	// 装配层负责注册提供商实现（Registry 经 init 注册；不 import 则不注册）
 	"github.com/hoshinojian/ciorch/internal/observe"
+	_ "github.com/hoshinojian/ciorch/internal/provider/vpsctl"
 	"github.com/hoshinojian/ciorch/internal/stats"
 )
 
