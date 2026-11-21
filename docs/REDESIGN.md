@@ -48,7 +48,7 @@
 - **P139 静默停摆**：runner online、busy=false、但不接活，journal 零日志，重启 runner 服务即愈。机器侧"日志静默"不能作判据（test job 跑的十几分钟本来就安静）。
 - **空闲删机后很快又来活**：11-17 15:25 空闲删机，15:47 又建，多付一次冷启。c2-4vcpu-8gb 约 $0.14/h，多留 25 分钟约 $0.06。
 - **GitHub/网络瞬时错误常见**：日志里有 TLS handshake timeout、HTTP 503。不能因为一次观察失败就做决策，更不能删机。
-- WSL 出站 22 端口被选择性阻断（nms pitfalls P3）；DO 机器之间无此问题。vpsctl `list` 输出含 `ipv4_private`（同区同账号同 VPC 可内网直连）。
+- WSL 出站 22 **按目标 IP 选择性丢包**（2026-11-21 编排器部署实测见 §11 V8：4 个新建 sgp1 IP 中 1 个全 TCP 被丢、ICMP 通、Windows ssh.exe 同样不通——按栈/按端口都绕不开，删机重建换 IP 即恢复。nms pitfalls P3 的"22 选择性阻断"即此形态）；DO 机器之间无此问题。vpsctl `list` 输出含 `ipv4_private`（同区同账号同 VPC 可内网直连）。
 - vpsctl `create` 的 `-wait` 缺省 0 = 不等待，建机 API 受理即返回（含 droplet id，可能尚无 IP）。
 
 ### 1.4 原型（cirunner@508a0b0）缺陷清单
@@ -919,9 +919,10 @@ ciorch `daemon -dry-run` 托管 nms，与原型并跑 ≥ 24 小时，对比两�
 | V2 | vpsctl `create -image <数字快照id>` 能否建机（vpsctl 把 image 作字符串原样传给 DO） | 阶段 7 | 阶段 7 前用一个临时快照试 | |
 | V3 | ETag 304 是否计入 rate limit | 只影响轮询频率上限的估算 | 看响应头 `X-RateLimit-Remaining` 前后变化 | **304 不计入**（2026-11-21 实测：同 token 先 `GET /rate_limit` 记 `core.used`，对同 URL 带 `If-None-Match` 连发 20 次全 304，再查 `used` 仅涨 1~3、3 组取最小 Δ1——涨幅与后台其他调用相当，若 304 计费应涨 ≈21）。注意：小时日志的 remaining 首尾不可用于此推导——同账号多方消费（原型/人工 gh）与整点重置会混入 |
 | V4 | DeepSeek JSON 模式的具体约束（提示词需含 "json"、是否支持 `deepseek-chat` 当前版本） | §3.10.4 | 阶段 5 前一次手工调用 | |
-| V5 | Caddy + sslip.io 能否顺利签发证书 | §3.14 | 阶段 4 部署时 | |
+| V5 | Caddy + sslip.io 能否顺利签发证书 | §3.14 | 阶段 4 部署时 | **顺利**（2026-11-21 编排器机实测：Ubuntu 24.04 `apt install caddy`（universe 版）对 `168-144-104-79.sslip.io` HTTP-01 一次成功，`certificate obtained successfully`；curl 外部验证 TLSv1.3、链 leaf ← LE YE1 ← ISRG Root X2/X1、`ssl_verify 0`。无需自有域名） |
 | V6 | P139 式假活在 GitHub 侧的表现：online+idle 持续多久？`kill -STOP` Listener 能否复现 | 场景 A 阈值是否合理 | 沙箱 S3 | **STOP 复现的是场景 C 不是 A**（2026-11-21 沙箱实测：`kill -STOP` Listener 后 GitHub 侧数分钟内转 `status=offline busy=false` 并全程维持；`kill -CONT` 后 **≤16s** 恢复 online）——挂起 Listener 表现为掉线，P139 的 online 假活是另一种形态（Listener 在跑但轮询逻辑卡死）；场景 A 阈值维持 §3.6.6 现值 |
 | V7 | `workflow_job` webhook 从 job 排队到送达的延迟 | 反应速度 | 对比 payload 的 `created_at` 与收件时间，取 20 个样本 | |
+| V8 | WSL 出站到 DO 新建机 22 的可达性（P3 口径复核） | §3.14 部署运维 | 建机后 ssh 实测 | **多数 IP 可达；个别新分到的 IP 全 TCP 被丢**（2026-11-21 编排器部署实测：4 个新 sgp1 IP 中 1 个 22/80/443/2222 全超时而 ICMP 通、老 IP 同时正常、Windows ssh.exe 同样不通、power cycle 无效——按目标 IP 的路径级丢包，删机重建换 IP 解决。结论：22 直连可用，无需高位端口/ssh.exe 兜底；建机脚本见 runbook §二对坏 IP 的处理） |
 
 ---
 

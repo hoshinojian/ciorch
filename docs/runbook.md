@@ -38,21 +38,60 @@
 前置：DO 机器已由 vpsctl 建好（规格见 REDESIGN §3.14：与 runner 同账号
 同区、最小 1vCPU 档、tag `ciorch-host`），Ubuntu 24.04，root 可登录。
 
-1. 放二进制：本仓 CI 产物或本地 `go build`，拷到 `/usr/local/bin/ciorch`；
-   同法放置 vpsctl 二进制与账号文件（路径写进 config 的 `vpsctl_bin` /
-   `vpsctl_accounts_file`——账号文件**只含 CI 专用账号**条目）。
-2. 手动放凭据（全部 `chmod 600`、属主 ciorch——install.sh 会检查）：
+**建机命令（2026-11-21 实测通过）**——`-authorized-keys` 对无密码账号
+（team2-ci）不会生效（vpsctl 只在密码账号的自动 cloud-init 里合并它），须
+自带 `-user-data`（cloud-config）注入公钥；且 DO 对未传**账号级** SSH key
+的建机请求会生成随机 root 密码并标记 expired，PAM 会拦住密钥登录
+（`Password change required but no TTY available`）——`chpasswd:
+expire: false` 不解决（没有密码被设置），要靠 `runcmd` 里的 `chage`：
+
+```sh
+~/vpsctl/bin/vpsctl create -only team2-ci -region sgp1 -size s-1vcpu-512mb-10gb \
+  -image ubuntu-24-04-x64 -name-prefix ciorch -tags ciorch-host \
+  -user-data orchestrator-userdata.yml -count 1 -wait 300s
+```
+
+```yaml
+# orchestrator-userdata.yml
+#cloud-config
+ssh_authorized_keys:
+  - <维护者公钥一行（~/.ssh/id_ed25519.pub）>
+chpasswd:
+  expire: false
+runcmd:
+  - chage -d "$(date +%Y-%m-%d)" root
+```
+
+**坏 IP 处理**（§11 V8）：个别新分到的 IP 从本机全 TCP 被丢（ICMP 通、
+22/80/443/2222 全超时、power cycle 无效）——删机重建换 IP 即可，不要去
+改 ssh 端口或折腾 ssh.exe。
+
+1. 放二进制：本仓 CI 产物或本地 `go build`（linux/amd64 静态：
+   `CGO_ENABLED=0 go build`），拷到 `/usr/local/bin/ciorch`；同法放置
+   vpsctl 二进制与账号文件（路径写进 config 的 `pools.<名>.vpsctl.bin` /
+   `accounts_file`——账号文件**只含 CI 专用账号**条目，从维护者本机
+   `~/.config/vpsctl/accounts.json` 只拷 team2-ci 一条到
+   `/etc/ciorch/vpsctl-accounts.json`，0600 属 ciorch）。
+2. 凭据（全部 `chmod 600`、属主 ciorch——install.sh 会检查）：
    - `/etc/ciorch/ciorch.json`（config；`github_app.app_id` 按上节）
    - `/etc/ciorch/app.pem`（App 私钥）
-   - `/etc/ciorch/webhook.secret`
-   - `/etc/ciorch/status.token`（`openssl rand -hex 24`）
-   - `/etc/ciorch/ssh/id_ed25519`（编排器对 runner 的 ssh 私钥；公钥进
-     `ssh_public_key_files`，另放维护者公钥）
+   - `/etc/ciorch/webhook.secret`（可直接机器上生成：
+     `openssl rand -hex 32 | tr -d '\n' > /etc/ciorch/webhook.secret`）
+   - `/etc/ciorch/status.token`（`openssl rand -hex 24 | tr -d '\n'`）
+   - `/etc/ciorch/ssh/id_ed25519`（编排器对 runner 的 ssh 私钥，可机器上
+     `ssh-keygen -t ed25519 -N '' -C ciorch-orchestrator -f …` 生成）。
+     **公钥 `/etc/ciorch/ssh/id_ed25519.pub` 与 `/etc/ciorch/maintainer.pub`
+     （维护者公钥一份）即 config `ssh_public_key_files` 引用的两个文件，
+     建 runner 时随 cloud-init 写入机器 authorized_keys——config 里别漏**。
    - `/etc/ciorch/deepseek.key`（阶段 5 事故管线用，可后放）
-3. 运行 `deploy/install.sh`（幂等；凭据缺/权限错会报错退出）。
-4. Caddy：`apt install caddy`，把 `deploy/Caddyfile` 中 `<PUBLIC_IP>`
-   替换为实际 IP 放到 `/etc/caddy/Caddyfile`，`systemctl reload caddy`
-   （证书自动申请——若 LE 对 sslip.io 签发不顺，改用自有域名）。
+3. 运行 `deploy/install.sh`（幂等；凭据缺/权限错会报错退出）。**先机后
+   凭据顺序**（App/Key 未到手时）：手动做 install.sh 的用户/目录/权限/
+   unit 步骤但**不 enable**，等凭据齐再跑 install.sh 收尾（它才会
+   enable——2026-11-21 首次部署即此形态）。
+4. Caddy：`apt install caddy`（Ubuntu 24.04 universe 版即可），把
+   `deploy/Caddyfile` 中 `<PUBLIC_IP>` 替换为实际 IP 放到
+   `/etc/caddy/Caddyfile`，`systemctl reload caddy`（证书自动申请——
+   LE 对 sslip.io 签发已实测顺利，§11 V5，暂无需自有域名）。
 5. ufw 按 `deploy/README.md` 只开 22/80/443。
 6. 回 GitHub App 设置页确认 Webhook URL 无误；仓变量配置：ciorch 仓
    Settings → Secrets and variables → Actions → Variables →
@@ -92,6 +131,9 @@
 
 - **V1 已实测（2026-11-21）**：GitHub 拒绝删除忙碌 runner（422）——Drain
   的"先注销后删机"防竞态成立，无需额外 busy 复查。
-- **V5**：LE 对 sslip.io 的签发在部署时验证，不顺则换自有域名。
+- **V5 已实测（2026-11-21）**：LE 对 sslip.io 签发顺利（§11 V5），暂无需
+  自有域名。
+- **ssh 可达性已实测（2026-11-21）**：WSL 直连 DO sgp1 机器 22 端口可用；
+  个别新 IP 全 TCP 被丢时删机重建换 IP（§11 V8），不动 ssh 端口。
 - 编排器机器**绝不注册为 runner**（持有全部凭据；REDESIGN §2.2 原则 12）。
 - runner 规格与区域不得改（nms：c2-4vcpu-8gb/sgp1，覆盖率口径依赖）。
