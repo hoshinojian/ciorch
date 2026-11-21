@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -615,8 +616,10 @@ func TestCreateUserDataIsCloudinitRenderOutput(t *testing.T) {
 	prof := cfg.Profiles["go-heavy"]
 	prof.ExtraPackages = []string{"htop"}
 	cfg.Profiles["go-heavy"] = prof
+	// 真实 .pub 文件带尾换行（S1 冒烟 2026-11-21：未 trim 时 Render 拒绝含
+	// 换行的公钥，建机全败）。
 	keyFile := filepath.Join(t.TempDir(), "key.pub")
-	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key"), 0o600)
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key\n"), 0o600)
 	cfg.SSHPublicKeyFiles = []string{keyFile}
 
 	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
@@ -662,12 +665,32 @@ func TestCreateUserDataIsCloudinitRenderOutput(t *testing.T) {
 	}
 }
 
+// 公钥文件按行读入并 trim：真实 .pub 文件带尾换行，cirunner Render 拒绝
+// 含换行的键；多行 authorized_keys 风格逐行成键，空行跳过。
+func TestPublicKeysFileLinesTrimmed(t *testing.T) {
+	dir := t.TempDir()
+	one := filepath.Join(dir, "one.pub")
+	os.WriteFile(one, []byte("ssh-ed25519 AAAAone one\n"), 0o600)
+	multi := filepath.Join(dir, "multi.pub")
+	os.WriteFile(multi, []byte("ssh-ed25519 AAAAtwo two\n\nssh-ed25519 AAAAthree three\n"), 0o600)
+
+	e := &Engine{Cfg: &config.Config{SSHPublicKeyFiles: []string{one, multi, filepath.Join(dir, "missing.pub")}},
+		Log: log.New(io.Discard, "", 0)}
+	got := e.publicKeys()
+	want := []string{"ssh-ed25519 AAAAone one", "ssh-ed25519 AAAAtwo two", "ssh-ed25519 AAAAthree three"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("publicKeys() = %q, want %q", got, want)
+	}
+}
+
 // dry-run 零写保证在真渲染器下继续成立。
 func TestDryRunZeroWritesWithRealRenderer(t *testing.T) {
 	cfg := testCfg(t)
 	cfg.MachineAgent = config.MachineAgentCfg{Version: "v0.1.3", SHA256: strings.Repeat("a", 64)}
+	// 真实 .pub 文件带尾换行（S1 冒烟 2026-11-21：未 trim 时 Render 拒绝含
+	// 换行的公钥，建机全败）。
 	keyFile := filepath.Join(t.TempDir(), "key.pub")
-	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key"), 0o600)
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key\n"), 0o600)
 	cfg.SSHPublicKeyFiles = []string{keyFile}
 
 	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
