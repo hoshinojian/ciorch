@@ -14,6 +14,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -426,6 +427,9 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 	return m.Name, nil
 }
 
+// publicKeys 逐文件按行读入公钥并 trim：真实 .pub 文件带尾换行，cirunner
+// Render 拒绝含换行的键（2026-11-21 S1 冒烟建机全败于此）；多行
+// authorized_keys 风格逐行成键，空行跳过。
 func (e *Engine) publicKeys() []string {
 	var keys []string
 	for _, f := range e.Cfg.SSHPublicKeyFiles {
@@ -434,7 +438,11 @@ func (e *Engine) publicKeys() []string {
 			e.Log.Printf("读公钥 %s 失败: %v", f, err)
 			continue
 		}
-		keys = append(keys, string(raw))
+		for _, line := range strings.Split(string(raw), "\n") {
+			if k := strings.TrimSpace(line); k != "" {
+				keys = append(keys, k)
+			}
+		}
 	}
 	return keys
 }
