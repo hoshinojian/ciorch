@@ -86,7 +86,7 @@
                      HTTPS（Caddy 终结 TLS）             ▼              │
 ┌─────────────── ciorch 编排器（DO 最小规格，常驻，不跑 CI）────────────┐ │
 │ webhook 收件 ─┐                                                      │ │
-│ 轮询兜底 ─────┼→ observe → decide（纯函数）→ execute ──vpsctl 子进程──┼─┼→ DO：建/删 runner 机器
+│ 轮询兜底 ─────┼→ observe → decide（纯函数）→ execute ──Provider（当前：vpsctl/DO）──┼─┼→ DO：建/删 runner 机器
 │               │                    │                                  │ │
 │               │                    └→ incident 状态机 → GitHub issue   │ │
 │               │                                  └→ DeepSeek API（只出主意）
@@ -116,6 +116,7 @@
 10. **钱有硬上限**：全局并发机器数、每仓上限、每日预算，由确定性代码执行，大模型无法突破。
 11. **一台 runner 机器只服务一个仓**：仓 A 的 CI 代码看不到仓 B 的任何东西。
 12. **编排器机器本身绝不注册为 runner**：它持有 DO token、App 私钥、DeepSeek key，而 CI 跑的是 PR 里的任意代码。
+13. **机器来源经 Provider 接口**（机器提供商抽象，见 [PROVIDER-ABSTRACTION.md](PROVIDER-ABSTRACTION.md)）：业务包只依赖 `internal/machine` 的提供商无关模型，不感知 vpsctl/DO 或将来的自建虚拟化；`internal/provider/*` 实现与 `cmd/` 装配层之外不得 import 具体实现（CI 检查强制）。
 
 ### 2.3 凭据放哪里
 
@@ -152,7 +153,9 @@ internal/engine/       执行动作：建机、删机、注销、ssh 动作、�
 internal/budget/       全局配额、每日花费估算
 internal/incident/     事故状态机、issue 读写、诊断材料采集、调用 LLM、校验结论、执行白名单动作
 internal/llm/          DeepSeek 客户端（OpenAI 兼容 chat/completions + JSON 模式）
-internal/vpsctlapi/    vpsctl 子进程封装（从 cirunner 原型迁入并改造：create 不等待）
+internal/machine/     提供商无关机器模型与 Provider/Namer 接口、Registry、契约测试套件（machinetest）
+internal/provider/    提供商实现（业务包不得 import；cmd/ 装配层除外）
+  └─ vpsctl/          vpsctl（DO）实现：子进程封装（自原型迁入并改造：create 不等待）+ 池配置 Factory
 internal/sshx/         系统 ssh 子进程封装
 internal/state/        持久化（原子写 + flock）
 internal/server/       HTTP：/webhook、/healthz、/status
@@ -164,7 +167,7 @@ docs/                  本设计的副本 + runbook
 
 ### 3.3 配置
 
-路径：`/etc/ciorch/ciorch.json`（开发时可 `-config` 指定）。示例（**仓内示例文件全部用占位符**）：
+路径：`/etc/ciorch/ciorch.json`（开发时可 `-config` 指定）。机器来源池化（2026-11-21 机器提供商抽象，[PROVIDER-ABSTRACTION.md](PROVIDER-ABSTRACTION.md) §3.3）。示例（**仓内示例文件全部用占位符**，完整见 `configs/ciorch.example.json`）：
 
 ```json
 {
@@ -173,15 +176,30 @@ docs/                  本设计的副本 + runbook
     "private_key_file": "/etc/ciorch/app.pem",
     "webhook_secret_file": "/etc/ciorch/webhook.secret"
   },
-  "vpsctl_bin": "/usr/local/bin/vpsctl",
-  "vpsctl_accounts_file": "/etc/ciorch/vpsctl-accounts.json",
+  "pools": {
+    "do-sgp1-c2": {
+      "provider": "vpsctl",
+      "max_machines": 2,
+      "vpsctl": {
+        "bin": "/usr/local/bin/vpsctl",
+        "accounts_file": "/etc/ciorch/vpsctl-accounts.json",
+        "account": "<CI 专用账号>",
+        "region": "sgp1",
+        "size": "c2-4vcpu-8gb",
+        "image": "ubuntu-24-04-x64",
+        "snapshot": "",
+        "prefer_private_ip": true,
+        "hourly_cost_hint": 0.21
+      }
+    }
+  },
   "ssh_private_key_file": "/etc/ciorch/ssh/id_ed25519",
   "ssh_public_key_files": ["/etc/ciorch/ssh/id_ed25519.pub", "/etc/ciorch/maintainer.pub"],
   "machine_agent": { "version": "v0.1.0", "sha256": "<release 资产 sha256>" },
   "listen": "127.0.0.1:8080",
   "state_dir": "/var/lib/ciorch",
   "global": {
-    "max_droplets": 2,
+    "max_machines": 2,
     "daily_budget_usd": 5.0
   },
   "llm": {
@@ -194,12 +212,7 @@ docs/                  本设计的副本 + runbook
   "maintainer_login": "hoshinojian",
   "profiles": {
     "go-heavy": {
-      "account": "team2-ci",
-      "region": "sgp1",
-      "fallback_regions": ["sgp1"],
-      "size": "c2-4vcpu-8gb",
-      "image": "ubuntu-24-04-x64",
-      "snapshot": "",
+      "pools": ["do-sgp1-c2"],
       "labels": ["ci"],
       "runners_per_droplet": 1
     }
@@ -215,17 +228,17 @@ docs/                  本设计的副本 + runbook
 }
 ```
 
-字段约束（`internal/config` 校验，错误信息中文、指出字段路径）：
+字段约束（`internal/config` 校验，错误信息中文、指出字段路径；池私有配置由对应 provider 的 Factory 校验）：
 
-- `repos[].repo` 形如 `owner/name`，不重复；**白名单语义**：App 装在某仓但配置里没有 → 一律忽略（webhook 直接 200 丢弃）。
-- `repos[].profile` 必须存在于 `profiles`。
-- `profiles.*.account` 必填（vpsctl `-only`，防全账号误建——2026-11-13 教训）。
-- `profiles.*.size` 对 nms：**必须保持 c2-4vcpu-8gb / sgp1**（专用核：共享核两次击穿 `-race` 时敏用例；同规格同区避免覆盖率基线重校，nms 决策 #148）。
+- **池（pool）**：`provider` 选实现（须已注册）；同名子对象放该实现的私有配置（只有对应实现解析，其他字段一律拒绝）；`max_machines` 是池容量上限（自有机器的物理上限；DO 池可等于全局上限）。
+- **profile**：只描述 runner（labels、每机 runner 数）和用哪些池。`pools` 是**有序列表**，为将来"本地优先、DO 溢出"预留；**当前校验强制长度为 1**，长度 >1 报"多池调度尚未实现"。
+- `global.max_machines` ≥ 任一仓的 `max_runners`；`Σ 池容量` 与全局上限的关系不强制；`state_dir` 必填。
 - `labels`：`^[A-Za-z0-9_-]+$`；`self-hosted`、`linux`、`x64` 为注册自动标签，不必写。
-- `max_runners` ≥1；`global.max_droplets` ≥ 任一仓的 `max_runners`。
 - `runners_per_droplet` 默认 1，取值 1~2（2 为实验特性，§3.6.4）。
 - `issue_repo` 空 = 在 `repo` 本身开 issue；非空 = 改投到指定仓（给不想在本仓开 issue 的项目用）。
-- `fallback_regions` 是大模型 `change_region` 动作的白名单（§3.10.5），为空则该动作不可用。
+- vpsctl 池私有配置：`bin/accounts_file/account/region/size/image` 必填（`account` 钉 vpsctl `-only`，防全账号误建——2026-11-13 教训）；`snapshot` 非空时建机用它替代 image（阶段 7）；`prefer_private_ip` 缺省 true；`hourly_cost_hint` **必须 >0**（空池建机的预算投影不能当 0，§3.7）。
+- 对 nms：**必须保持 c2-4vcpu-8gb / sgp1**（专用核：共享核两次击穿 `-race` 时敏用例；同规格同区避免覆盖率基线重校，nms 决策 #148）。
+- 旧 schema（顶层 `vpsctl_bin`、`global.max_droplets`、profile 内建机参数等）不做兼容解析，检出即给迁移提示（指向 PROVIDER-ABSTRACTION.md §3.3）。
 
 决策参数（全部有默认值，可在 `global.tuning` 下覆盖，名字与 §3.6.6 参数表一致）。
 
@@ -290,8 +303,8 @@ docs/                  本设计的副本 + runbook
 3. 只保留 job `status ∈ {queued, in_progress}`；`waiting`（环境审批）、`requested`、`pending` 不算需求但记录计数（status 输出用；2026-11-20 确认落点为 `Obs.PendingJobs` 字段）。
 4. **label 匹配**：job 的 labels（小写化）⊆ `{self-hosted, linux, x64} ∪ profile.labels`（小写化）→ `Matchable=true`。不可匹配的 queued job 记入 `UnmatchedQueued`（场景 E）。
 5. 列 runner（含 labels、status、busy）。
-6. `vpsctl list -tag <仓 tag> -only <account>` 列本仓 droplet（含 created_at、ipv4_private、price_monthly）。
-7. 任一步失败：`Obs.Complete=false`，分路记录 `JobsOK/RunnersOK/DropletsOK`，其余路照采。decide 对不完整观察**整轮冻结**（见 §2.2 原则 7 修订）——原"只建不删"在 droplets 缺失时会超建，已收紧。
+6. 机器一路：经该仓所属池的 `machine.Provider.List(仓 tag)` 列本仓机器（含 Pool、CreatedAt、Addr、HourlyCost——提供商无关视图）。
+7. 任一步失败：`Obs.Complete=false`，分路记录 `JobsOK/RunnersOK/MachinesOK`，其余路照采。decide 对不完整观察**整轮冻结**（见 §2.2 原则 7 修订）——原"只建不删"在机器一路缺失时会超建，已收紧。
 
 ```go
 type Obs struct {
@@ -300,7 +313,7 @@ type Obs struct {
     Jobs       []Job         // 未完成且 Matchable 的 job（queued + in_progress）
     UnmatchedQueued []Job    // labels 无法满足的 queued job
     Runners    []Runner      // 本仓全部注册（含外部）
-    Droplets   []Droplet     // 本仓 tag 下的 droplet
+    Machines   []machine.Machine // 本仓 tag 下的机器（提供商无关视图，含 Pool/Addr/HourlyCost）
 }
 type Job struct {
     ID, RunID  int64
@@ -444,12 +457,16 @@ type Breaker struct {
 
 ### 3.7 预算与配额（internal/budget）
 
-- 全局并发：所有仓 droplet 总数 ≤ `max_droplets`。统计方式：`vpsctl list -tag ciorch -only <每个用到的 account>`，按 droplet id 去重（同 token 多账号会重复，原型已踩过）。
-- 每日预算：`hourly = price_monthly / 672`（DO 月封顶 672 小时口径）；当日花费 = Σ 每台 droplet 当日存活小时 × hourly（按 UTC 自然日，状态里累计已删机器的部分）。预计建一台后超过 `daily_budget_usd` → 不建，触发场景 F。
-  （2026-11-20 口径确认："预计建一台"按**新机 1 小时**计——满 24h 投影会让本节示例的 $5 日预算永远建不了 c2 机型，与示例矛盾；真实花费由 SpentToday/RecordDeletion 入账兜底。）
-- 多仓争抢：同一轮各仓先各自 Decide 出 `Create` 请求，再由 budget 统一分配，**按 QAge 从老到新**排序发放。
-- 腾配额：某仓场景 F 时，若其他仓有 online、busy=false、Q==0 的机器 → 对其 `Drain`（不受该仓 idle_timeout 限制），下一轮再分配。
+机器提供商抽象后的口径（[PROVIDER-ABSTRACTION.md](PROVIDER-ABSTRACTION.md) §3.4）：
+
+- **成本**：`Machine.HourlyCost` 由提供商给出（vpsctl 按 `price_monthly / 672`，DO 月封顶 672 小时口径折算）；budget 包不出现月价与 672。自有机器可为 0。
+- **全局并发**：所有仓机器总数 ≤ `global.max_machines`。统计方式：对每个池 `List(公共标记)` 后按 (池, ID) 去重。
+- **池容量**：目标池在建机前同时过 `pools.<名>.max_machines`（在途占坑同样计入）。
+- **每日预算**：当日花费 = Σ 每台机器当日存活小时 × HourlyCost（按 UTC 自然日，状态里累计已删机器的部分）。预计建一台后超过 `daily_budget_usd` → 不建，触发场景 F。"预计建一台"按**新机 1 小时**计，价格取**目标池最近一台机器的 HourlyCost**；池空时用池配置 `hourly_cost_hint`（加载期强制 >0）；两者皆无则拒绝（不能当 0，防 DO 池绕过预算）。
+- **多仓争抢**：同一轮各仓先各自 Decide 出 `Create` 请求，再由 budget 统一分配，**按 QAge 从老到新**排序发放。
+- **腾配额**：某仓场景 F 时，若其他仓有 online、busy=false、Q==0 的机器 → 对其 `Drain`（不受该仓 idle_timeout 限制），下一轮再分配。
 - 编排器自身机器不计入。
+- 持久化的当日花费（state.json 的 `day_utc/spent_today`）字段名不变，升级不清零。
 
 ### 3.8 执行（internal/engine）
 
@@ -467,8 +484,8 @@ const (
 )
 ```
 
-- **建机**：`NextName`（同原型：现存同名空间最大序号 +1）→ 铸 registration token → `cirunner/pkg/cloudinit.Render` → 写临时文件（0600，建机成功即删，失败保留供诊断）→ `vpsctl create ... -count 1 -start-index N -tags ciorch,<仓tag>,<额外> -user-data <file>`，**不带 `-wait`**。vpsctlapi 必须允许返回结果里 IP 为空（原型的 `Create` 把"无公网 IP"当错误，要改）。超时 90s。
-- **Drain**：`DELETE runner 注册` → 成功 → `vpsctl delete -ids <account>/<id> -confirm 1`。注销失败（尤其 GitHub 拒绝删忙碌 runner【待实测 V1】）→ 本轮放弃删机，下一轮重判。若 V1 实测 GitHub 允许删除忙碌 runner：删前在同一轮内再拉一次 runner 列表复核 busy=false，并在 §11 记录竞态窗口仍存在。
+- **建机**（经该仓所属池的 `machine.Provider.Create`，§3.5 路由）：名字由池的 Namer 取（vpsctl 池：现存同名空间最大序号 +1，跳号）→ 铸 registration token → `cirunner/pkg/cloudinit.Render` → 传 `CreateRequest{Name, Tags, UserData}`（cloud-init 落盘 0600、成功即删、失败保留供诊断，由 Provider 负责）。vpsctl 实现内部把名字拆回 `-name-prefix`+`-start-index`，**不带 `-wait`**，受理即返回、IP 可为空。超时 90s。
+- **Drain**：`DELETE runner 注册` → 成功 → 按机器的 Pool 路由到所属池 `Provider.Delete(id)`。注销失败（尤其 GitHub 拒绝删忙碌 runner【待实测 V1】）→ 本轮放弃删机，下一轮重判。若 V1 实测 GitHub 允许删除忙碌 runner：删前在同一轮内再拉一次 runner 列表复核 busy=false，并在 §11 记录竞态窗口仍存在。
 - **SSHAct**：`ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i <key> root@<私网IP> /usr/local/bin/cirunner act <name> --json`，超时 60s；私网 IP 缺失时用公网 IP。（机器是一次性的、IP 复用，不维护 known_hosts；同 VPC 内中间人风险可接受。）
 - **执行顺序**：同一轮先执行 `RemoveReg`/`Drain`/`ForceDelete`，再 `Create`，最后 `SSHAct`、`Incident`。
 - **隔离**：每个动作独立 `context` 超时；失败写 WARN 日志并回填到状态（`CreateFailStreak`、事故证据），不中断其他动作。
@@ -555,8 +572,8 @@ waiting-human ──issue 被人关闭──► resolved（并清熔断、解除
   "root_cause": "string，中文，≤500 字",
   "confidence": 0.0,
   "evidence": ["引用诊断材料中的具体字段/日志行"],
-  "action": "none | restart_runner | replace_droplet | drain_droplet | change_region | pause_repo | clear_breaker | rerun_failed_jobs",
-  "action_args": {"droplet": "名称", "region": "slug", "duration_min": 60, "run_id": 0},
+  "action": "none | restart_runner | replace_droplet | drain_droplet | switch_pool | pause_repo | clear_breaker | rerun_failed_jobs",
+  "action_args": {"machine": "名称", "pool": "池名", "duration_min": 60, "run_id": 0},
   "needs_human": false,
   "human_steps": "string，需要人时写具体步骤",
   "issue_comment": "string，Markdown，写进 issue 的诊断说明"
@@ -571,7 +588,7 @@ waiting-human ──issue 被人关闭──► resolved（并清熔断、解除
 | 场景 | 允许的动作 |
 |---|---|
 | A 假活 | none, restart_runner, replace_droplet, drain_droplet |
-| B 冷启失败 / 熔断 | none, change_region, clear_breaker, pause_repo |
+| B 冷启失败 / 熔断 | none, switch_pool, clear_breaker, pause_repo |
 | C 掉线 | none, replace_droplet |
 | D job 卡死 | none, drain_droplet, rerun_failed_jobs |
 | E label 不匹配 | none（只能建议人改配置） |
@@ -579,10 +596,10 @@ waiting-human ──issue 被人关闭──► resolved（并清熔断、解除
 | H 观察失败 / I 建机报错 | none, pause_repo |
 | J 孤儿机器 | none（必须人确认） |
 
-- `action_args.droplet` 必须是**本仓所辖**的现存 droplet；`region` 必须在 profile 的 `fallback_regions` 里；`duration_min ∈ [10, 360]`；`run_id` 必须是本仓近 24h 的 run，且该 run 的失败 job 日志里含 runner 丢失类特征（`lost communication`、`shutdown signal`、`The operation was canceled` 之一），否则拒绝。
+- `action_args.machine` 必须是**本仓所辖**的现存机器；`pool` 必须在该仓 profile 的 `pools` 列表里（当前长度 1，即该动作实际不可迁移，待多池调度落地后生效）；`duration_min ∈ [10, 360]`；`run_id` 必须是本仓近 24h 的 run，且该 run 的失败 job 日志里含 runner 丢失类特征（`lost communication`、`shutdown signal`、`The operation was canceled` 之一），否则拒绝。
 - `confidence < 0.5` 且 action≠none → 降级为 none + needs_human。
-- 动作执行仍受 §3.7 配额/预算约束；`replace_droplet` 无配额时降级为 drain 后再建。
-- `change_region` 的效果：该仓临时（6h）改用指定 region 建机，到期恢复；记入状态。
+- 动作执行仍受 §3.7 配额/预算约束；`replace_droplet` 无配额时降级为 drain 后再建（droplet 字样为历史动作名，语义即"替换机器"）。
+- `switch_pool` 的效果（原 `change_region` 的池化改法，事故管线阶段 5 按此实现）：该仓临时（6h）改用指定池建机，到期恢复；记入状态。
 - `pause_repo`：该仓停止建机 `duration_min` 分钟（已有机器照常跑完、照常空闲回收）。
 
 #### 3.10.6 人工介入
@@ -639,16 +656,16 @@ ciorch [-config path] check-config         只校验配置与凭据可用性（A
 
 ---
 
-## 4. 与 vpsctl 的契约
+## 4. 与 vpsctl 的契约（vpsctl 提供商实现的契约）
 
-- 子进程调用，不 import（vpsctl 库代码都在 internal/）。二进制路径配置显式锚定。
+- 子进程调用，不 import（vpsctl 库代码都在 vpsctl 仓 internal/ 下）。二进制路径在池配置 `pools.<名>.vpsctl.bin` 显式锚定。契约内容不变：
 - 用到的命令：
   - `create -only <acc> -region -size -image -name-prefix -count 1 -start-index N -tags a,b,c -user-data <file>`（不带 -wait）
   - `list -tag <tag> -only <acc>`（JSON：`droplets[]` 含 `id`(字符串)、`name`、`created_at`、`ipv4_public`、`ipv4_private`、`price_monthly`、`tags`；`errors[]` 非空即视为观察失败）
   - `delete -ids <acc>/<id> -confirm 1`（JSON 数组，逐项 `ok`）
 - vpsctl 的守卫：带 `ssh_password` 的账号与 `--user-data` 互斥 → CI 用**无密码账号条目**（team2-ci）。
 - vpsctl 会自动追加 `batch:<时间戳>` tag，不影响归属判定。
-- 原型 `internal/vpsctlapi` 可整体迁入 ciorch 再改：`Create` 允许空 IP；`Droplet` 加 `IPv4Private`、`PriceMonthly` 字段。
+- （已落地：封装并入 `internal/provider/vpsctl/client.go`，`Create` 允许空 IP，机器视图折成 `machine.Machine`——2026-11-21 机器提供商抽象。）
 
 ---
 

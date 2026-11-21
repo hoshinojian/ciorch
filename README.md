@@ -6,12 +6,17 @@
 `cirunner health/diag/act`）。
 
 完整设计（唯一依据）：[docs/REDESIGN.md](docs/REDESIGN.md)。
+机器来源已抽象为 Provider 接口（vpsctl/DO 是第一个、目前唯一的实现），配置
+按"池"组织：[docs/PROVIDER-ABSTRACTION.md](docs/PROVIDER-ABSTRACTION.md)
+（示例配置见 [configs/ciorch.example.json](configs/ciorch.example.json)，全部占位符）。
 
-## 当前状态（阶段 2 完成）
+## 当前状态（阶段 2 完成 + 机器提供商抽象）
 
 决策核心（observe/decide/budget/engine/state/daemon）已落地并经单测覆盖；
 `plan`/`status`/`daemon -dry-run` 可对真实仓只读运行（建机执行面待阶段 3
 cirunner `pkg/cloudinit` 接入后启用）。事故管线与 webhook 在阶段 4/5。
+机器模型与建/删/列/命名经 `internal/machine.Provider` 提供商无关化：业务包
+不感知 vpsctl/DO（CI 有 import 边界检查），将来可加自建虚拟化池。
 
 ```
 ciorch [-config path] stats  [-repo owner/name] [-since 7d]   基线统计
