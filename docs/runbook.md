@@ -14,7 +14,8 @@
      （例：IP `203.0.113.10` → `203-0-113-10.sslip.io`；部署后才有——可先
      填占位、部署后回改，或按"先部署后建 App"顺序执行 §二）
    - **Webhook secret**：随机 32 字节 hex（`openssl rand -hex 32`），存为
-     编排器上的 `/etc/ciorch/webhook.secret`
+     编排器上的 `/etc/ciorch/webhook.secret`（文件末尾的换行会被 ciorch 自动
+     去掉——两边口径一致；去空白后不足 16 字节会拒绝启动）
 3. 权限（Repository permissions）：
    - **Administration: Read and write**（铸 runner registration token、列/删 runner）
    - **Actions: Read and write**（读 runs/jobs/日志；rerun-failed-jobs）
@@ -23,6 +24,10 @@
 4. 订阅事件（Subscribe to events）：勾 **Workflow job** 与 **Issues** 两个。
 5. 点 **Create GitHub App**，随后：
    - 记下 **App ID**（About 面板）→ 填 config `github_app.app_id`
+   - 记下 **App slug**（About 面板，App name 的小写连字符形式）→ 填 config
+     `github_app.app_slug`（bot 账号登录名为 `<slug>[bot]`；编排器自己关闭
+     issue 触发的 webhook 据此识别并忽略，不算人工关闭。不填则该过滤关闭，
+     仍有事故侧状态防护兜底）
    - 页面底部 **Private keys → Generate a private key**，下载的 `.pem`
      存为编排器上的 `/etc/ciorch/app.pem`（chmod 600）
 6. 安装（Install App）：**Only select repositories** → 先只选

@@ -296,12 +296,20 @@ func pruneTimes(ts []time.Time, now time.Time) []time.Time {
 
 // HumanResolved 人工关闭 issue 后的入口（webhook issues.closed → server 调用；
 // §3.10.6）：事故 resolved + 清熔断/解除 pause/CreateFailStreak=0。
+// repo 参数是 issue 所在仓（配置了 issue_repo 时是改投仓，不是托管仓）；
+// 只处理仍活跃的事故——编排器自己关闭（自动恢复）触发的同名 webhook 会
+// 看到事故已是 resolved，此处直接忽略，不会误清熔断。
 func (m *Manager) HumanResolved(repo string, issueNumber int64) {
 	now := m.Now()
 	m.mu.Lock()
 	var hit *Incident
 	for _, inc := range m.incidents {
-		if inc.Repo == repo && inc.IssueNumber == issueNumber {
+		// 事故 issue 开在 IssueRepo（为空 = 托管仓本身）
+		at := inc.IssueRepo
+		if at == "" {
+			at = inc.Repo
+		}
+		if at == repo && inc.IssueNumber == issueNumber {
 			hit = inc
 			break
 		}
@@ -311,14 +319,21 @@ func (m *Manager) HumanResolved(repo string, issueNumber int64) {
 		m.Log.Printf("[incident][%s] issue #%d 无对应事故（已清理或他因关闭）", repo, issueNumber)
 		return
 	}
+	if hit.State == StateResolved {
+		m.mu.Unlock()
+		// 自动恢复（或此前的人工关闭）已处理过；编排器自己关 issue 引发的
+		// webhook 走到这里——不算人工介入，不动熔断/退避/pause
+		m.Log.Printf("[incident][%s] issue #%d 对应事故已是 resolved，忽略（自动关闭回声）", repo, issueNumber)
+		return
+	}
 	hit.State = StateResolved
 	hit.ResolvedAt = now
 	m.mu.Unlock()
 	if m.Exec != nil {
-		m.Exec.HumanCleared(repo)
+		m.Exec.HumanCleared(hit.Repo) // 清托管仓（issue 可能开在改投仓）
 	}
-	m.appendJSONL(now, repo, hit.Type, hit.Subject, "human", fmt.Sprintf("人工关闭 issue #%d", issueNumber))
-	m.Log.Printf("[incident][%s] 人工关闭 issue #%d → 事故 %s/%s resolved，已清熔断/退避/pause", repo, issueNumber, hit.Type, hit.Subject)
+	m.appendJSONL(now, hit.Repo, hit.Type, hit.Subject, "human", fmt.Sprintf("人工关闭 issue #%d（issue 仓 %s）", issueNumber, repo))
+	m.Log.Printf("[incident][%s] 人工关闭 issue #%d（%s）→ 事故 %s/%s resolved，已清熔断/退避/pause", hit.Repo, issueNumber, repo, hit.Type, hit.Subject)
 }
 
 // Note 向时间线追加一条（daemon 每轮摘要、engine 动作结果由装配层喂入）。

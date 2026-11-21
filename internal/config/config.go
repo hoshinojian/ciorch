@@ -24,6 +24,9 @@ type GitHubAppCfg struct {
 	AppID             int64  `json:"app_id"`
 	PrivateKeyFile    string `json:"private_key_file"`
 	WebhookSecretFile string `json:"webhook_secret_file"`
+	// AppSlug 是 App 的 slug（可选）：bot 账号登录名为 "<slug>[bot]"，
+	// webhook issues.closed 由 App bot 发起时不算人工关闭（防自触发清熔断）。
+	AppSlug string `json:"app_slug"`
 }
 
 // MachineAgentCfg 是机器侧 cirunner 二进制的版本钉扎（cloud-init 下载校验用）。
