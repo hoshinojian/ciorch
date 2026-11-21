@@ -75,9 +75,9 @@ type Incident struct {
 	FirstSeen           time.Time
 	LastSeen            time.Time
 	ResolvedAt          time.Time
-	QuietRounds         int // Tick 累计的连续未复发轮数
-	LLMRounds           int // 已用诊断轮次（限额每事故 3）
-	Remedies24h         int // 近 24h 固定逻辑补救次数（NoteRemedy 计数）
+	QuietRounds         int             // Tick 累计的连续未复发轮数
+	LLMRounds           int             // 已用诊断轮次（限额每事故 3）
+	PreviousRounds      []previousRound // 历轮结论与动作结果（下一轮证据的一部分）
 }
 
 // Entry 是时间线一条（observe | action | result）。
@@ -97,19 +97,14 @@ type IssuesAPI interface {
 	ReopenIssue(ctx context.Context, repo string, number int64) error
 }
 
-// Executor 是事故动作对执行面的要求（engine 实现；本 PR 只用 HumanCleared，
-// 白名单动作在后续 PR 扩展）。
-type Executor interface {
-	// HumanCleared 人工关闭 issue 后的清理：清熔断、解除 pause、CreateFailStreak=0。
-	HumanCleared(repo string)
-}
-
 // Options 是 Manager 的配置。
 type Options struct {
 	MaintainerLogin   string
 	IssueRepoOf       func(repo string) string // 空 = 在本仓开（§3.3 issue_repo）
 	MaxLLMPerIncident int                      // 默认 3（§3.10.4）
 	MaxLLMPerDay      int                      // 默认 20
+	// PoolsOf 返回该仓 profile.pools（switch_pool 白名单校验；装配层注入）。
+	PoolsOf func(repo string) []string
 }
 
 // Manager 是事故模块入口（engine.OnIncident 接 Handle；daemon 每轮接 Tick）。
@@ -119,6 +114,10 @@ type Manager struct {
 	Opt    Options
 	Now    func() time.Time
 	Log    *log.Logger
+	// LLM 是诊断客户端（nil = 不诊断：diagnosing 停留至安静恢复）。
+	LLM LLMClient
+	// Evidence 是诊断材料采集面（nil = 无证据，诊断不可用）。
+	Evidence EvidenceSource
 	// DryRun（shadow）：只记日志与 jsonl，不开 issue、不调 LLM、不执行动作。
 	DryRun bool
 
@@ -127,6 +126,9 @@ type Manager struct {
 	timeline  map[string][]Entry  // repo → 最近 timelineKeep 条
 	remedies  map[Key][]time.Time // 近 24h 固定逻辑补救时刻（独立于事故记录——补救不开 issue，不能污染 24h issue 复用判定）
 	jsonlPath string
+
+	llmDayUTC   string // 每日 LLM 调用计数（§3.10.4 限额；持久化）
+	llmDayCount int
 }
 
 // New 构造。stateDir 为空则不落 jsonl（测试用）。
@@ -224,14 +226,16 @@ func (m *Manager) Handle(ctx context.Context, repo string, a decide.Action) erro
 	return nil
 }
 
-// Tick 每轮调用（daemon）：活跃事故连续 quietRoundsToResolve 轮未复发 →
-// resolved（评论依据并关闭）。
+// Tick 每轮调用（daemon）：先推进诊断轮（diagnosing → acting → verifying），
+// 再做安静恢复——连续 quietRoundsToResolve 轮未复发 → resolved（评论依据
+// 并关闭）。waiting-human 不自动恢复（§3.10.6：只有人工关闭 issue 才 resolved）。
 func (m *Manager) Tick(ctx context.Context, repo string) {
 	now := m.Now()
+	m.diagnoseTick(ctx, repo)
 	m.mu.Lock()
 	var toResolve []*Incident
 	for _, inc := range m.incidents {
-		if inc.Repo != repo || inc.State == StateResolved {
+		if inc.Repo != repo || inc.State == StateResolved || inc.State == StateWaitingHuman {
 			continue
 		}
 		inc.QuietRounds++
