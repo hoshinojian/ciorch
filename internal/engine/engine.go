@@ -51,12 +51,17 @@ type CloudRenderer interface {
 	Render(o RenderParams) ([]byte, error)
 }
 
-// RenderParams 是渲染入参的 engine 视图。
+// RenderParams 是渲染入参的 engine 视图（Agent/实例字段来自 config 的
+// machine_agent 与 profile，渲染器接入时补齐）。
 type RenderParams struct {
 	RepoURL, ServiceRepo, RunnerName string
 	Labels                           []string
 	Token                            string
 	PublicKeys                       []string
+	AgentVersion                     string
+	AgentSHA256                      string
+	RunnersPerDroplet                int
+	ExtraPackages                    []string
 }
 
 // Engine 是执行面。
@@ -353,20 +358,21 @@ func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.
 	name := prov.Namer().Next(repo.NamePrefix(), machineNames(obs.Machines))
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	if e.Renderer == nil {
-		return "", fmt.Errorf("cloud-init 渲染器未接入（cirunner pkg/cloudinit，阶段 3）——本阶段只允许 dry-run")
-	}
 	token, err := e.GH.MintToken(ctxTO, repo.Repo)
 	if err != nil {
 		return "", fmt.Errorf("铸 registration token: %w", err)
 	}
 	ci, err := e.Renderer.Render(RenderParams{
-		RepoURL:     "https://github.com/" + repo.Repo,
-		ServiceRepo: serviceRepo(repo.Repo),
-		RunnerName:  name,
-		Labels:      p.Labels,
-		Token:       token,
-		PublicKeys:  e.publicKeys(),
+		RepoURL:           "https://github.com/" + repo.Repo,
+		ServiceRepo:       serviceRepo(repo.Repo),
+		RunnerName:        name,
+		Labels:            p.Labels,
+		Token:             token,
+		PublicKeys:        e.publicKeys(),
+		AgentVersion:      e.Cfg.MachineAgent.Version,
+		AgentSHA256:       e.Cfg.MachineAgent.SHA256,
+		RunnersPerDroplet: p.RunnersPerDroplet,
+		ExtraPackages:     p.ExtraPackages,
 	})
 	if err != nil {
 		return "", fmt.Errorf("渲染 cloud-init: %w", err)

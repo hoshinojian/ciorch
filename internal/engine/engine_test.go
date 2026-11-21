@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/hoshinojian/ciorch/internal/budget"
+
+	"github.com/hoshinojian/cirunner/pkg/cloudinit"
 
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
@@ -596,4 +600,84 @@ type routeObs struct{ byRepo map[string]observe.Obs }
 
 func (r *routeObs) Collect(ctx context.Context, re config.RepoEntry, p config.Profile) (observe.Obs, error) {
 	return r.byRepo[re.Repo], nil
+}
+
+// 渲染器接入（阶段 3 收口）：建机请求的 UserData 必须是 pkg/cloudinit.Render
+// 的产物（Agent 钉扎、rpd、extra_packages 全链路从 config 传入）。
+func TestCreateUserDataIsCloudinitRenderOutput(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.MachineAgent = config.MachineAgentCfg{Version: "v0.1.3", SHA256: strings.Repeat("a", 64)}
+	prof := cfg.Profiles["go-heavy"]
+	prof.ExtraPackages = []string{"htop"}
+	cfg.Profiles["go-heavy"] = prof
+	keyFile := filepath.Join(t.TempDir(), "key.pub")
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key"), 0o600)
+	cfg.SSHPublicKeyFiles = []string{keyFile}
+
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	pool := newFakePool()
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, CloudInitRenderer{Agent: cfg.MachineAgent}, log.New(io.Discard, "", 0))
+	e.SetCollector(&fakeObs{o})
+
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], false); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Created) != 1 {
+		t.Fatalf("应建 1 台：%v", pool.Created)
+	}
+	got := pool.Created[0].UserData
+
+	name := pool.Created[0].Name
+	want, err := cloudinit.Render(cloudinit.Params{
+		RepoURL:           "https://github.com/hoshinojian/nms",
+		ServiceRepo:       "hoshinojian-nms",
+		RunnerName:        name,
+		Labels:            []string{"ci"},
+		Token:             "REGTOKEN1234567890", // fakeGH.MintToken 的固定返回
+		PublicKeys:        []string{"ssh-ed25519 AAAAtest key"},
+		AgentVersion:      "v0.1.3",
+		AgentSHA256:       strings.Repeat("a", 64),
+		ExtraPackages:     []string{"htop"},
+		RunnersPerDroplet: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("UserData 不是 Render 产物（got %d 字节 want %d 字节）", len(got), len(want))
+	}
+	if !strings.Contains(string(got), "releases/download/v0.1.3/cirunner-linux-amd64") ||
+		!strings.Contains(string(got), strings.Repeat("a", 64)) || !strings.Contains(string(got), "- htop") {
+		t.Fatal("UserData 缺 Agent 钉扎或 extra_packages")
+	}
+}
+
+// dry-run 零写保证在真渲染器下继续成立。
+func TestDryRunZeroWritesWithRealRenderer(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.MachineAgent = config.MachineAgentCfg{Version: "v0.1.3", SHA256: strings.Repeat("a", 64)}
+	keyFile := filepath.Join(t.TempDir(), "key.pub")
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest key"), 0o600)
+	cfg.SSHPublicKeyFiles = []string{keyFile}
+
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	pool := newFakePool()
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) observe.Pool {
+		return observe.Pool{Name: "go-heavy", Provider: providers[r.Profile]}
+	}
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, CloudInitRenderer{Agent: cfg.MachineAgent}, log.New(io.Discard, "", 0))
+	e.SetCollector(&fakeObs{o})
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], true); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.Created) != 0 {
+		t.Fatalf("dry-run 必须零建机：%v", pool.Created)
+	}
 }

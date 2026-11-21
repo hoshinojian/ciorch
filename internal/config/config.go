@@ -103,6 +103,7 @@ type Profile struct {
 	Pools             []string `json:"pools"` // 有序列表（将来"本地优先、DO 溢出"预留；当前强制长度 1）
 	Labels            []string `json:"labels"`
 	RunnersPerDroplet int      `json:"runners_per_droplet"`
+	ExtraPackages     []string `json:"extra_packages"` // 底座五包之外追加（REDESIGN §3.3）
 }
 
 // RepoEntry 是一个托管仓。
@@ -133,6 +134,7 @@ type Config struct {
 var (
 	repoRe  = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 	labelRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	pkgRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]+$`)
 )
 
 // Load 读取并校验配置（错误信息中文、指出字段路径）。
@@ -248,6 +250,11 @@ func (c *Config) validate() error {
 		}
 		if p.RunnersPerDroplet < 1 || p.RunnersPerDroplet > 2 {
 			return fmt.Errorf("profiles.%s.runners_per_droplet：取值 1~2（2 为实验特性）", name)
+		}
+		for _, pkg := range p.ExtraPackages {
+			if !pkgRe.MatchString(pkg) {
+				return fmt.Errorf("profiles.%s.extra_packages：%q 不是合法包名", name, pkg)
+			}
 		}
 	}
 	seen := map[string]bool{}
