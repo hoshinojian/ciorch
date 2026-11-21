@@ -24,6 +24,7 @@ import (
 	// 装配层负责注册提供商实现（Registry 经 init 注册；不 import 则不注册）
 	"github.com/hoshinojian/ciorch/internal/observe"
 	_ "github.com/hoshinojian/ciorch/internal/provider/vpsctl"
+	"github.com/hoshinojian/ciorch/internal/server"
 	"github.com/hoshinojian/ciorch/internal/stats"
 )
 
@@ -171,7 +172,7 @@ func wiring(cfg *config.Config, token string) (*runtime, error) {
 		pn := cfg.PoolNameOf(p)
 		return observe.Pool{Name: pn, Provider: rt.providers[pn]}
 	}
-	rt.collector = &observe.Collector{GH: rt.gh, PoolOf: rt.poolOf}
+	rt.collector = &observe.Collector{GH: rt.gh, PoolOf: rt.poolOf, Cache: observe.NewJobCache()}
 	rt.engine = engine.New(cfg, rt.gh, rt.providers, rt.poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, engine.CloudInitRenderer{Agent: cfg.MachineAgent}, log.Default())
 	rt.engine.SetCollector(rt.collector)
 	return rt, nil
@@ -277,6 +278,38 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	rt.engine.Gate = budget.NewGate(b, rt.providers, rt.poolCaps, rt.hints) // 全局+池容量+预算互斥闸门
 	d := daemon.New(cfg, rt.engine, b, log.Default())
 	d.Usage = rt.gh.SwapUsage // 每小时用量日志：requests/304/Remaining 首尾（V3 推法）
+	// HTTP 面（§3.11）：webhook secret 文件配置了才起；dry-run 下同样
+	// 只入缓存+触发 reconcile，零写入。
+	if cfg.GitHubApp.WebhookSecretFile != "" {
+		secret, err := os.ReadFile(cfg.GitHubApp.WebhookSecretFile)
+		if err != nil {
+			return fmt.Errorf("读 webhook secret: %w", err)
+		}
+		whitelist := map[string]bool{}
+		for _, r := range cfg.Repos {
+			whitelist[r.Repo] = true
+		}
+		statusToken := ""
+		if cfg.StatusTokenFile != "" {
+			raw, err := os.ReadFile(cfg.StatusTokenFile)
+			if err != nil {
+				return fmt.Errorf("读 status token: %w", err)
+			}
+			statusToken = strings.TrimSpace(string(raw))
+		}
+		d.Handler = server.New(server.Deps{
+			WebhookSecret: secret,
+			Repos:         whitelist,
+			Cache:         rt.collector.Cache,
+			Trigger:       d.Trigger,
+			LastOK:        d.LastOKTime,
+			PollIdle:      d.PollIdle,
+			StatusToken:   statusToken,
+			StatusBody:    d.StatusSnapshot,
+			Log:           log.Default(),
+		})
+		d.ListenAddr = cfg.Listen
+	}
 	if dryRun {
 		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")
 		d.DryRun = true // 透传到每轮 Reconcile——此前只打印提示仍是真执行（审查修正 1）

@@ -76,6 +76,41 @@ func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, lg *log.Logger)
 	}
 }
 
+// LastOKTime 返回最近一次完整 reconcile 时刻（healthz 判据）。
+func (d *Daemon) LastOKTime() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastOK
+}
+
+// StatusSnapshot 返回 /status 载荷（各仓 Q/I/P/N + 机器 + 熔断 + 未结事故计数）。
+func (d *Daemon) StatusSnapshot() any {
+	d.mu.Lock()
+	stats := make(map[string]engine.RoundStats, len(d.lastStats))
+	for k, v := range d.lastStats {
+		stats[k] = v
+	}
+	d.mu.Unlock()
+	states := d.Engine.StatesSnapshot()
+	type repoView struct {
+		Q, I, P, N int
+		QAge       time.Duration
+		Complete   bool
+		Breaker    string
+		Machines   int
+	}
+	out := map[string]repoView{}
+	for repo, st := range stats {
+		rv := repoView{Q: st.Q, I: st.I, P: st.P, N: st.N, QAge: st.QAge, Complete: st.Complete}
+		if rs, ok := states[repo]; ok {
+			rv.Breaker = rs.Breaker.State
+			rv.Machines = len(rs.Machines)
+		}
+		out[repo] = rv
+	}
+	return out
+}
+
 // Trigger 请求某仓立即 reconcile（webhook 入口，阶段 4 接入；重复触发合并）。
 func (d *Daemon) Trigger(repo string) {
 	d.mu.Lock()
@@ -192,8 +227,8 @@ func (d *Daemon) round(ctx context.Context, repo config.RepoEntry, statePath str
 	}
 	d.mu.Lock()
 	d.lastStats[repo.Repo] = stats
-	if obs2, oerr := d.Engine.Collector.Collect(ctx, repo, d.Cfg.ProfileOf(repo)); oerr == nil && obs2.Complete {
-		d.lastOK = now // 一轮观察完整即视为健康（healthz 判据）
+	if stats.Complete {
+		d.lastOK = now // 本轮观察完整即视为健康（healthz 判据，无额外 API）
 	}
 	d.mu.Unlock()
 
