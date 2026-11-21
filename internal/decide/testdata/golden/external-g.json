@@ -1,0 +1,44 @@
+[
+  {
+    "round": 0,
+    "actions": [
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "扩容：排队需求超出在线空闲与冷启在途供给"
+      },
+      {
+        "Kind": "incident",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "G",
+        "IncidentKey": "gitrunner-sgp2",
+        "Reason": "外部 runner 疑似假活（online 不接活），只告知不操作"
+      }
+    ],
+    "state": {
+      "Machines": {},
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  }
+]

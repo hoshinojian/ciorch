@@ -1,0 +1,247 @@
+[
+  {
+    "round": 0,
+    "actions": [
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "扩容：排队需求超出在线空闲与冷启在途供给"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "0001-01-01T00:00:00Z",
+          "FirstOnlineAt": "2026-11-20T11:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 1,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 1,
+    "actions": [
+      {
+        "Kind": "force-delete",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-01",
+        "DropletName": "ci-nms-team2-ci-sgp1-01",
+        "RunnerID": 1,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）"
+      },
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "场景 C 掉线：有排队需求，先建替换机（不让队列空窗）"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "0001-01-01T00:00:00Z",
+          "FirstOnlineAt": "2026-11-20T11:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 2,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "replacing",
+          "RemedyAt": "2026-11-20T12:00:00Z",
+          "Bad": true
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": [
+        "2026-11-20T12:00:00Z"
+      ],
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 2,
+    "actions": null,
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-02": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "2026-11-20T12:00:00Z",
+          "IdleSince": "2026-11-20T12:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": [
+        "2026-11-20T12:00:00Z"
+      ],
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 3,
+    "actions": [
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "扩容：排队需求超出在线空闲与冷启在途供给"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-02": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "2026-11-20T12:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 1,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": [
+        "2026-11-20T12:00:00Z"
+      ],
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 4,
+    "actions": [
+      {
+        "Kind": "force-delete",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-02",
+        "DropletName": "ci-nms-team2-ci-sgp1-02",
+        "RunnerID": 2,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）"
+      },
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "场景 C 掉线：有排队需求，先建替换机（不让队列空窗）"
+      },
+      {
+        "Kind": "incident",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "C",
+        "IncidentKey": "ci-nms-team2-ci-sgp1-02",
+        "Reason": "同仓 24h 内第 2 次掉线（场景 C 升级判据）"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-02": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "2026-11-20T12:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 2,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "replacing",
+          "RemedyAt": "2026-11-20T12:00:00Z",
+          "Bad": true
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": [
+        "2026-11-20T12:00:00Z",
+        "2026-11-20T12:00:00Z"
+      ],
+      "ObserveFailStreak": 0
+    }
+  }
+]

@@ -1,0 +1,33 @@
+[
+  {
+    "round": 0,
+    "actions": [
+      {
+        "Kind": "incident",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "E",
+        "IncidentKey": "nonexistent",
+        "Reason": "label 组合无 profile 可满足且最老排队已超 5m（配置错误信号）"
+      }
+    ],
+    "state": {
+      "Machines": {},
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  }
+]

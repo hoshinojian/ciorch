@@ -1,0 +1,104 @@
+[
+  {
+    "round": 0,
+    "actions": [
+      {
+        "Kind": "incident",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "D",
+        "IncidentKey": "ci-nms-team2-ci-sgp1-01",
+        "Reason": "场景 D job 卡死：本机 in_progress job 持续超告警线"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "2026-11-20T12:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "2026-11-20T12:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": [
+        "2026-11-20T10:59:00Z"
+      ],
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 1,
+    "actions": [
+      {
+        "Kind": "force-delete",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-01",
+        "DropletName": "ci-nms-team2-ci-sgp1-01",
+        "RunnerID": 23,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）"
+      },
+      {
+        "Kind": "incident",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "D",
+        "IncidentKey": "ci-nms-team2-ci-sgp1-01",
+        "Reason": "场景 D job 卡死：本机 in_progress job 持续超告警线"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "2026-11-20T12:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "2026-11-20T12:00:00Z",
+          "Remedy": "draining",
+          "RemedyAt": "2026-11-20T12:00:00Z",
+          "Bad": true
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": [
+        "2026-11-20T10:29:00Z",
+        "2026-11-20T10:59:00Z"
+      ],
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  }
+]

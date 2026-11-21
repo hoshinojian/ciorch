@@ -1,0 +1,119 @@
+[
+  {
+    "round": 0,
+    "actions": null,
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "0001-01-01T00:00:00Z",
+          "FirstOnlineAt": "2026-11-20T11:30:00Z",
+          "IdleSince": "2026-11-20T11:41:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 1,
+    "actions": [
+      {
+        "Kind": "drain",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-01",
+        "DropletName": "ci-nms-team2-ci-sgp1-01",
+        "RunnerID": 23,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "空闲回收：无排队且 runner 空闲超时（一轮只回收最老一台）"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "0001-01-01T00:00:00Z",
+          "FirstOnlineAt": "2026-11-20T11:30:00Z",
+          "IdleSince": "2026-11-20T11:41:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "draining",
+          "RemedyAt": "2026-11-20T12:02:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 2,
+    "actions": [
+      {
+        "Kind": "drain",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-01",
+        "DropletName": "ci-nms-team2-ci-sgp1-01",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "Drain 已注销、删机未生效：重试删除（非掉线，不记事件）"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "0001-01-01T00:00:00Z",
+          "FirstOnlineAt": "2026-11-20T11:30:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 1,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "draining",
+          "RemedyAt": "2026-11-20T12:02:00Z",
+          "Bad": true
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  }
+]
