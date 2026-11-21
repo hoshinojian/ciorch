@@ -36,6 +36,23 @@ func testDaemon(t *testing.T) *Daemon {
 	return New(cfg, e, &budget.Budget{MaxMachines: 2, DailyBudgetUSD: 5}, log.New(io.Discard, "", 0))
 }
 
+// global.tuning 的 poll_active/poll_idle 覆盖默认轮询间隔（§3.6.6；
+// 2026-11-21 冒烟发现 tuning 此前是死配置，本测守护接线）。
+func TestNewAppliesPollTuning(t *testing.T) {
+	d := testDaemon(t)
+	d.Cfg.Global.Tuning = map[string]string{"poll_active": "5s", "poll_idle": "30s"}
+	d2 := New(d.Cfg, d.Engine, d.Budget, log.New(io.Discard, "", 0))
+	if d2.PollActive != 5*time.Second || d2.PollIdle != 30*time.Second {
+		t.Fatalf("poll 覆盖未生效: %v/%v", d2.PollActive, d2.PollIdle)
+	}
+	// 非法值保默认（不 panic、不清零）
+	d.Cfg.Global.Tuning = map[string]string{"poll_active": "nope"}
+	d3 := New(d.Cfg, d.Engine, d.Budget, log.New(io.Discard, "", 0))
+	if d3.PollActive != defaultPollActive {
+		t.Fatalf("非法值应保默认: %v", d3.PollActive)
+	}
+}
+
 // 间隔切换（§3.6.6）：空闲 → poll_idle；冷启在途/在忙/补救中 → poll_active。
 func TestNextIntervalSwitching(t *testing.T) {
 	d := testDaemon(t)

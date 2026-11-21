@@ -74,18 +74,30 @@ type Daemon struct {
 	ListenAddr string
 }
 
-// New 构造。
+// New 构造。global.tuning 的 poll_active/poll_idle 覆盖默认轮询间隔
+// （§3.6.6；决策阈值键在 engine.Reconcile 经 decide.ApplyTuning 生效）。
 func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, lg *log.Logger) *Daemon {
 	if lg == nil {
 		lg = log.Default()
 	}
-	return &Daemon{
+	d := &Daemon{
 		Cfg: cfg, Engine: e, Budget: b, Log: lg,
 		PollActive: defaultPollActive, PollIdle: defaultPollIdle,
 		Now:       time.Now,
 		triggers:  map[string]chan struct{}{},
 		lastStats: map[string]engine.RoundStats{},
 	}
+	for k, dst := range map[string]*time.Duration{"poll_active": &d.PollActive, "poll_idle": &d.PollIdle} {
+		if v, ok := cfg.Global.Tuning[k]; ok {
+			dur, err := time.ParseDuration(v)
+			if err != nil || dur <= 0 {
+				lg.Printf("global.tuning %s=%q 非法（须为正时长），用默认 %v", k, v, *dst)
+				continue
+			}
+			*dst = dur
+		}
+	}
+	return d
 }
 
 // LastOKTime 返回最近一次完整 reconcile 时刻（healthz 判据）。

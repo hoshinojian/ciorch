@@ -665,6 +665,16 @@ func TestCreateUserDataIsCloudinitRenderOutput(t *testing.T) {
 	}
 }
 
+// global.tuning 非法（未知键/坏值）在 Reconcile 即报错，不带病运行
+// （2026-11-21 冒烟发现 tuning 此前无任何消费方）。
+func TestReconcileRejectsInvalidTuning(t *testing.T) {
+	e := newEngine(t, &fakeGH{}, newFakePool(), &fakeObs{observe.Obs{Now: tnow, Complete: true}})
+	e.Cfg.Global.Tuning = map[string]string{"job_stuck_alert": "not-a-duration"}
+	if _, _, err := e.Reconcile(context.Background(), e.Cfg.Repos[0], false); err == nil {
+		t.Fatal("非法 tuning 应报错")
+	}
+}
+
 // 同一轮的多个 create 必须取名互异：取名基于本轮观察快照，第二个 create
 // 看不到第一个（2026-11-21 S1 冒烟：两台同名，GitHub 拒绝重名注册 →
 // 第二台 cloud-init 失败成僵尸，且状态按名合并使场景 B 看不见它）。
