@@ -1,0 +1,64 @@
+[
+  {
+    "round": 0,
+    "actions": null,
+    "state": {
+      "Machines": {},
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 1
+    }
+  },
+  {
+    "round": 1,
+    "actions": [
+      {
+        "Kind": "drain",
+        "DropletID": "d-ci-nms-team2-ci-sgp1-01",
+        "DropletName": "ci-nms-team2-ci-sgp1-01",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "硬寿命到期：机器年龄超上限且回收窗口（观察不完整也执行，防成本泄漏）"
+      }
+    ],
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "2026-11-20T12:00:00Z",
+          "FirstOnlineAt": "0001-01-01T00:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 0,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "draining",
+          "RemedyAt": "2026-11-20T12:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 2
+    }
+  }
+]

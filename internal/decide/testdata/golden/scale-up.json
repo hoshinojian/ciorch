@@ -1,0 +1,86 @@
+[
+  {
+    "round": 0,
+    "actions": [
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "扩容：排队需求超出在线空闲与冷启在途供给"
+      },
+      {
+        "Kind": "create",
+        "DropletID": "",
+        "DropletName": "",
+        "RunnerID": 0,
+        "RunnerName": "",
+        "SSHAct": "",
+        "IncidentType": "",
+        "IncidentKey": "",
+        "Reason": "扩容：排队需求超出在线空闲与冷启在途供给"
+      }
+    ],
+    "state": {
+      "Machines": {},
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  },
+  {
+    "round": 1,
+    "actions": null,
+    "state": {
+      "Machines": {
+        "ci-nms-team2-ci-sgp1-01": {
+          "FirstSeen": "2026-11-20T12:00:20Z",
+          "FirstOnlineAt": "0001-01-01T00:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 1,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        },
+        "ci-nms-team2-ci-sgp1-02": {
+          "FirstSeen": "2026-11-20T12:00:20Z",
+          "FirstOnlineAt": "0001-01-01T00:00:00Z",
+          "IdleSince": "0001-01-01T00:00:00Z",
+          "StallSamples": 0,
+          "OfflineSamples": 1,
+          "BusySince": "0001-01-01T00:00:00Z",
+          "Remedy": "",
+          "RemedyAt": "0001-01-01T00:00:00Z",
+          "Bad": false
+        }
+      },
+      "Breaker": {
+        "State": "closed",
+        "Fails": 0,
+        "OpenedAt": "0001-01-01T00:00:00Z",
+        "Cooldown": 0
+      },
+      "CreateBackoffUntil": "0001-01-01T00:00:00Z",
+      "CreateFailStreak": 0,
+      "LastActivity": null,
+      "StallEvents": null,
+      "OfflineEvents": null,
+      "ObserveFailStreak": 0
+    }
+  }
+]
