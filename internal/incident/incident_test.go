@@ -83,14 +83,70 @@ func (f *fakeIssues) ReopenIssue(ctx context.Context, repo string, number int64)
 }
 
 type fakeExec struct {
-	mu      sync.Mutex
-	cleared []string
+	mu       sync.Mutex
+	cleared  []string
+	restarts []string
+	drains   []string
+	replaces []string
+	pauses   map[string]time.Duration
+	breakers []string
+	switches []string
+	reruns   []int64
 }
 
 func (f *fakeExec) HumanCleared(repo string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cleared = append(f.cleared, repo)
+}
+
+func (f *fakeExec) RestartRunner(ctx context.Context, repo, machine string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restarts = append(f.restarts, machine)
+	return nil
+}
+
+func (f *fakeExec) DrainMachine(ctx context.Context, repo, machine string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drains = append(f.drains, machine)
+	return nil
+}
+
+func (f *fakeExec) ReplaceMachine(ctx context.Context, repo, machine string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replaces = append(f.replaces, machine)
+	return nil
+}
+
+func (f *fakeExec) PauseRepo(repo string, d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pauses == nil {
+		f.pauses = map[string]time.Duration{}
+	}
+	f.pauses[repo] = d
+}
+
+func (f *fakeExec) ClearBreaker(repo string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.breakers = append(f.breakers, repo)
+}
+
+func (f *fakeExec) SwitchPool(repo, pool string, d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.switches = append(f.switches, repo+"→"+pool)
+}
+
+func (f *fakeExec) RerunFailedJobs(ctx context.Context, repo string, runID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reruns = append(f.reruns, runID)
+	return nil
 }
 
 // testClock 是可推进的注入时钟。
