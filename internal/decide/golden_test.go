@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
@@ -54,7 +55,7 @@ func goldenScenarios() []goldenScenario {
 		o := obs()
 		o.Now = now
 		o.Jobs = []observe.Job{queuedJob(1, 3*time.Minute)}
-		o.Droplets = []observe.Droplet{droplet(n01, time.Hour)}
+		o.Machines = []machine.Machine{droplet(n01, time.Hour)}
 		o.Runners = []observe.Runner{onlineRunner(n01, false)}
 		return o
 	}
@@ -68,7 +69,7 @@ func goldenScenarios() []goldenScenario {
 					o := obs()
 					o.Now = at(20 * time.Second)
 					q7(&o) // 两台冷启在途
-					o.Droplets = []observe.Droplet{droplet(n01, 20*time.Second), droplet(n02, 20*time.Second)}
+					o.Machines = []machine.Machine{droplet(n01, 20*time.Second), droplet(n02, 20*time.Second)}
 					return o
 				}(),
 			},
@@ -81,21 +82,21 @@ func goldenScenarios() []goldenScenario {
 			obs: []observe.Obs{
 				func() observe.Obs {
 					o := obs()
-					o.Droplets = []observe.Droplet{droplet(n01, 30*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n01, 30*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n01, false)}
 					return o
 				}(),
 				func() observe.Obs {
 					o := obs()
 					o.Now = at(2 * time.Minute)
-					o.Droplets = []observe.Droplet{droplet(n01, 32*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n01, 32*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n01, false)}
 					return o
 				}(), // 空闲 21m → Drain
 				func() observe.Obs {
 					o := obs()
 					o.Now = at(4 * time.Minute)
-					o.Droplets = []observe.Droplet{droplet(n01, 34*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n01, 34*time.Minute)}
 					return o
 				}(), // 注册已消失、机器还在 → Bad 重发 Drain（R7）
 			},
@@ -111,28 +112,28 @@ func goldenScenarios() []goldenScenario {
 				func() observe.Obs { // 换 -02：先 online 一轮（FirstOnlineAt 记账，未满 60s 不判）
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(2, 3*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, 20*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n02, 20*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // +90s：样本 1
 					o := stallObs(at(90 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, 20*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n02, 20*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // 样本 2
 					o := stallObs(at(90 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, 20*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n02, 20*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // 样本 3 → 命中：24h 内第 2 次 → 事故 A
 					o := stallObs(at(90 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, 21*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n02, 21*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
@@ -144,19 +145,19 @@ func goldenScenarios() []goldenScenario {
 				func() observe.Obs {
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(1, 9*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n01, 9*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n01, 9*time.Minute)}
 					return o
 				}(), // B：ForceDelete + Fails=1
 				func() observe.Obs {
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(1, 9*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, 9*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n02, 9*time.Minute)}
 					return o
 				}(), // 第 2 台：Fails=2
 				func() observe.Obs {
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(1, 9*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n03, 9*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n03, 9*time.Minute)}
 					return o
 				}(), // 第 3 台：open + 事故 B
 				func() observe.Obs { o := obs(); q7(&o); return o }(), // open 内不建
@@ -169,7 +170,7 @@ func goldenScenarios() []goldenScenario {
 				func() observe.Obs { // 试探机 online → closed、Fails=0
 					o := obs()
 					o.Now = at(34 * time.Minute)
-					o.Droplets = []observe.Droplet{droplet(n04, 3*time.Minute)}
+					o.Machines = []machine.Machine{droplet(n04, 3*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n04, false)}
 					return o
 				}(),
@@ -182,35 +183,35 @@ func goldenScenarios() []goldenScenario {
 				func() observe.Obs { // 样本 1
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(1, time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n01, time.Hour)}
+					o.Machines = []machine.Machine{droplet(n01, time.Hour)}
 					o.Runners = []observe.Runner{{ID: 1, Name: n01, Status: "offline"}}
 					return o
 				}(),
 				func() observe.Obs { // 判死：ForceDelete + Create
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(1, 2*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n01, time.Hour)}
+					o.Machines = []machine.Machine{droplet(n01, time.Hour)}
 					o.Runners = []observe.Runner{{ID: 1, Name: n01, Status: "offline"}}
 					return o
 				}(),
 				func() observe.Obs { // 换 -02，先 online 一轮（FirstOnlineAt 记账）
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(2, time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, time.Hour)}
+					o.Machines = []machine.Machine{droplet(n02, time.Hour)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // -02 掉线，第 1 个样本
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(2, time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, time.Hour)}
+					o.Machines = []machine.Machine{droplet(n02, time.Hour)}
 					o.Runners = []observe.Runner{{ID: 2, Name: n02, Status: "offline"}}
 					return o
 				}(),
 				func() observe.Obs { // 第 2 个样本 → 判死 + 24h 内第 2 次 → 事故 C
 					o := obs()
 					o.Jobs = []observe.Job{queuedJob(2, 2*time.Minute)}
-					o.Droplets = []observe.Droplet{droplet(n02, time.Hour)}
+					o.Machines = []machine.Machine{droplet(n02, time.Hour)}
 					o.Runners = []observe.Runner{{ID: 2, Name: n02, Status: "offline"}}
 					return o
 				}(),
@@ -221,14 +222,14 @@ func goldenScenarios() []goldenScenario {
 			obs: []observe.Obs{
 				func() observe.Obs { // 61m → 事故 D
 					o := obs()
-					o.Droplets = []observe.Droplet{droplet(n01, 2*time.Hour)}
+					o.Machines = []machine.Machine{droplet(n01, 2*time.Hour)}
 					o.Runners = []observe.Runner{onlineRunner(n01, true)}
 					o.Jobs = []observe.Job{{ID: 5, RunID: 1, Status: "in_progress", RunnerName: n01, CreatedAt: at(-61 * time.Minute), StartedAt: at(-61 * time.Minute)}}
 					return o
 				}(),
 				func() observe.Obs { // 91m → 事故 D + ForceDelete
 					o := obs()
-					o.Droplets = []observe.Droplet{droplet(n01, 2*time.Hour)}
+					o.Machines = []machine.Machine{droplet(n01, 2*time.Hour)}
 					o.Runners = []observe.Runner{onlineRunner(n01, true)}
 					o.Jobs = []observe.Job{{ID: 5, RunID: 1, Status: "in_progress", RunnerName: n01, CreatedAt: at(-91 * time.Minute), StartedAt: at(-91 * time.Minute)}}
 					return o
@@ -246,9 +247,9 @@ func goldenScenarios() []goldenScenario {
 				}(),
 				func() observe.Obs { // droplets 一路成功：硬寿命回收仍执行
 					o := obs()
-					o.Complete, o.JobsOK, o.DropletsOK = false, false, true
+					o.Complete, o.JobsOK, o.MachinesOK = false, false, true
 					o.RunnersOK = false
-					o.Droplets = []observe.Droplet{droplet(n01, 9*time.Hour)}
+					o.Machines = []machine.Machine{droplet(n01, 9*time.Hour)}
 					return o
 				}(),
 			},

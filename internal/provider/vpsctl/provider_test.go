@@ -13,11 +13,8 @@ import (
 	"time"
 
 	"github.com/hoshinojian/ciorch/internal/config"
-	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/machine/machinetest"
-	"github.com/hoshinojian/ciorch/internal/observe"
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 var t0 = time.Date(2026, 11, 21, 8, 0, 0, 0, time.UTC)
@@ -30,7 +27,7 @@ type fakeBin struct {
 	mu              sync.Mutex
 	account, region string
 
-	droplets    []vpsctlapi.Droplet
+	droplets    []Droplet
 	nextID      int
 	createCalls [][]string // 每次 create 的完整 argv
 	userData    map[string][]byte
@@ -64,20 +61,20 @@ func (f *fakeBin) run(ctx context.Context, bin string, args ...string) ([]byte, 
 		}
 		f.nextID++
 		name := fmt.Sprintf("%s-%s-%s-%02d", flags["-name-prefix"], f.account, f.region, start)
-		d := vpsctlapi.Droplet{
+		d := Droplet{
 			Account: f.account, ID: fmt.Sprintf("%d", 1000+f.nextID), Name: name,
 			Status: "new", Region: f.region, Size: flags["-size"],
 			IPv4Private: fmt.Sprintf("10.0.0.%d", f.nextID), PriceMonthly: 141,
 			Tags: strings.Split(flags["-tags"], ","), CreatedAt: t0,
 		}
 		f.droplets = append(f.droplets, d)
-		out, _ := json.Marshal(map[string]any{"batch": "b1", "created": []vpsctlapi.Droplet{d}})
+		out, _ := json.Marshal(map[string]any{"batch": "b1", "created": []Droplet{d}})
 		return out, nil
 	case "list":
 		if f.listErr {
 			return []byte(`{"droplets":[],"errors":[{"account":"` + f.account + `","error":"token 失效"}]}`), nil
 		}
-		var kept []vpsctlapi.Droplet
+		var kept []Droplet
 		for _, d := range f.droplets {
 			for _, tg := range d.Tags {
 				if tg == flags["-tag"] {
@@ -90,7 +87,7 @@ func (f *fakeBin) run(ctx context.Context, bin string, args ...string) ([]byte, 
 		return out, nil
 	case "delete":
 		parts := strings.SplitN(flags["-ids"], "/", 2)
-		var kept []vpsctlapi.Droplet
+		var kept []Droplet
 		for _, d := range f.droplets {
 			if len(parts) == 2 && parts[1] == d.ID {
 				continue
@@ -152,14 +149,8 @@ func TestNamerByteIdenticalWithLegacy(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: Next=%q want %q", c.name, got, c.want)
 		}
-		// 交叉对照现存旧实现（PR ③ 删除 decide.NextName 时移除本段）
-		legacyExisting := make([]observe.Droplet, len(c.existing))
-		for i, nm := range c.existing {
-			legacyExisting[i] = observe.Droplet{Name: nm}
-		}
-		if legacy := decide.NextName("ci-nms", "team2-ci", "sgp1", legacyExisting); legacy != got {
-			t.Errorf("%s: 与旧 decide.NextName 不一致：new=%q legacy=%q", c.name, got, legacy)
-		}
+		// 交叉对照旧 decide.NextName 的活体比对已在 PR ②（#18，两实现并存期）
+		// 完成并留档；decide.NextName 随 PR ③ 删除，此处由字面期望值锁行为。
 	}
 	// Pattern 与旧 config.NamespacePattern 逐字节一致（删除旧实现时移除本段）
 	re := config.RepoEntry{Repo: "hoshinojian/nms"}
@@ -209,7 +200,7 @@ func TestCreateArgvMatchesLegacy(t *testing.T) {
 func TestListMapsCostAndAddr(t *testing.T) {
 	p, bin, _ := newTestProvider(t)
 	bin.mu.Lock()
-	bin.droplets = []vpsctlapi.Droplet{
+	bin.droplets = []Droplet{
 		{Account: "team2-ci", ID: "1", Name: "ci-nms-team2-ci-sgp1-01", Tags: []string{"ciorch"}, PriceMonthly: 141, IPv4Private: "10.0.0.5", IPv4Public: "1.2.3.4", CreatedAt: t0},
 		{Account: "team2-ci", ID: "2", Name: "ci-nms-team2-ci-sgp1-02", Tags: []string{"ciorch"}, PriceMonthly: 141, IPv4Public: "5.6.7.8", CreatedAt: t0},
 		{Account: "team2-ci", ID: "3", Name: "ci-nms-team2-ci-sgp1-03", Tags: []string{"ciorch"}, PriceMonthly: 141, CreatedAt: t0},

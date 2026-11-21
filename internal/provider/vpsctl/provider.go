@@ -1,7 +1,7 @@
 // Package vpsctl 是 vpsctl（DigitalOcean）的 machine.Provider 实现
-// （docs/PROVIDER-ABSTRACTION.md §3.5）。子进程封装暂时复用 internal/vpsctlapi
-// ——旧包在调用方全部切换（实施计划 PR ③）前暂留；届时封装代码并入本包并
-// 删除旧包。业务包只允许依赖 internal/machine，不得 import 本包（CI 检查）。
+// （docs/PROVIDER-ABSTRACTION.md §3.5）。子进程封装在 client.go（自
+// internal/vpsctlapi 并入，旧包已删除）。业务包只允许依赖 internal/machine，
+// 不得 import 本包（CI import 检查强制）。
 package vpsctl
 
 import (
@@ -15,7 +15,6 @@ import (
 	"sync/atomic"
 
 	"github.com/hoshinojian/ciorch/internal/machine"
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 // hoursPerMonth 是 DO 月封顶小时数口径（REDESIGN §3.7）：
@@ -39,7 +38,7 @@ type Options struct {
 type Provider struct {
 	pool    string
 	opt     Options
-	client  *vpsctlapi.Client
+	client  *Client
 	dataDir string // cloud-init 落盘目录（0700；建机成功即删，失败留存供诊断）
 	nam     namer
 
@@ -51,7 +50,7 @@ type Provider struct {
 func NewProvider(pool string, opt Options, userDataDir string) *Provider {
 	return &Provider{
 		pool: pool, opt: opt, dataDir: userDataDir,
-		client: vpsctlapi.NewClient(opt.Bin, opt.AccountsFile),
+		client: NewClient(opt.Bin, opt.AccountsFile),
 		nam:    namer{account: opt.Account, region: opt.Region},
 	}
 }
@@ -94,7 +93,7 @@ func (p *Provider) Create(ctx context.Context, req machine.CreateRequest) (machi
 	if err := os.WriteFile(path, req.UserData, 0o600); err != nil {
 		return machine.Machine{}, fmt.Errorf("写 cloud-init: %w", err)
 	}
-	d, err := p.client.Create(ctx, vpsctlapi.CreateOpts{
+	d, err := p.client.Create(ctx, CreateOpts{
 		Account: p.opt.Account, Region: p.opt.Region, Size: p.opt.Size, Image: p.opt.Image,
 		NamePrefix: prefix, StartIndex: start,
 		Tags: req.Tags, UserDataFile: path,
@@ -139,7 +138,7 @@ func (p *Provider) FailNextList() { p.failList.Store(true) }
 
 // toMachine 把 vpsctl 视图折成提供商无关视图。Addr：私网优先（可配），
 // 缺私网用公网，都缺为空（engine 侧跳过 ssh）。
-func (p *Provider) toMachine(d vpsctlapi.Droplet) machine.Machine {
+func (p *Provider) toMachine(d Droplet) machine.Machine {
 	addr := d.IPv4Public
 	if p.opt.PreferPrivateIP && d.IPv4Private != "" {
 		addr = d.IPv4Private

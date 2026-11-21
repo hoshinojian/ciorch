@@ -39,7 +39,6 @@ type Daemon struct {
 	Cfg                  *config.Config
 	Engine               *engine.Engine
 	Budget               *budget.Budget
-	Lister               budget.Lister
 	Log                  *log.Logger
 	PollActive, PollIdle time.Duration
 	Now                  Clock
@@ -54,12 +53,12 @@ type Daemon struct {
 }
 
 // New 构造。
-func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, l budget.Lister, lg *log.Logger) *Daemon {
+func New(cfg *config.Config, e *engine.Engine, b *budget.Budget, lg *log.Logger) *Daemon {
 	if lg == nil {
 		lg = log.Default()
 	}
 	return &Daemon{
-		Cfg: cfg, Engine: e, Budget: b, Lister: l, Log: lg,
+		Cfg: cfg, Engine: e, Budget: b, Log: lg,
 		PollActive: defaultPollActive, PollIdle: defaultPollIdle,
 		Now:       time.Now,
 		triggers:  map[string]chan struct{}{},

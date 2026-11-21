@@ -1,4 +1,4 @@
-package vpsctlapi
+package vpsctl
 
 import (
 	"context"

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -20,9 +21,10 @@ import (
 	"github.com/hoshinojian/ciorch/internal/daemon"
 	"github.com/hoshinojian/ciorch/internal/engine"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
+	"github.com/hoshinojian/ciorch/internal/provider/vpsctl"
 	"github.com/hoshinojian/ciorch/internal/stats"
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 const defaultConfigPath = "/etc/ciorch/ciorch.json"
@@ -116,6 +118,8 @@ func usage() {
 }
 
 // wiring 组装真实客户端与执行面（daemon/plan/status 共用）。
+// 过渡桥（实施计划 PR ③→④ 之间）：旧配置无池概念，按 profile 合成单池、
+// 池名 = profile 名；PR ④ 池化配置落地后改为按 cfg.Pools 构造。
 func wiring(cfg *config.Config, token string) (*githubapp.Client, *observe.Collector, *engine.Engine, error) {
 	tok, err := config.ResolveToken(cfg, token, func() (string, error) {
 		return githubapp.GHToken(context.Background(), "gh", nil)
@@ -124,11 +128,30 @@ func wiring(cfg *config.Config, token string) (*githubapp.Client, *observe.Colle
 		return nil, nil, nil, err
 	}
 	gh := githubapp.NewClient(tok)
-	vps := vpsctlapi.NewClient(cfg.VPSctlBin, cfg.VPSctlAccountsFile)
-	collector := &observe.Collector{GH: gh, VPS: &observe.VPSAdapter{Client: vps}}
-	e := engine.New(cfg, gh, vps, sshx{keyFile: cfg.SSHPrivateKeyFile}, nil, log.Default())
+	providers, poolOf := legacyProviders(cfg)
+	collector := &observe.Collector{GH: gh, PoolOf: poolOf}
+	e := engine.New(cfg, gh, providers, poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, nil, log.Default())
 	e.SetCollector(collector)
 	return gh, collector, e, nil
+}
+
+// legacyProviders 按旧配置的 profile 合成池（池名 = profile 名，provider=vpsctl）。
+func legacyProviders(cfg *config.Config) (map[string]machine.Provider, engine.PoolOf) {
+	stateDir := cfg.StateDir
+	if stateDir == "" {
+		home, _ := os.UserHomeDir()
+		stateDir = filepath.Join(home, ".local", "state", "ciorch")
+	}
+	providers := map[string]machine.Provider{}
+	for name, p := range cfg.Profiles {
+		providers[name] = vpsctl.NewProvider(name, vpsctl.Options{
+			Bin: cfg.VPSctlBin, AccountsFile: cfg.VPSctlAccountsFile,
+			Account: p.Account, Region: p.Region, Size: p.Size, Image: p.Image,
+			PreferPrivateIP: true, // 现行行为：私网优先（REDESIGN §3.8）
+		}, filepath.Join(stateDir, "cloudinit"))
+	}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	return providers, poolOf
 }
 
 func reposOf(cfg *config.Config, repoFilter string) []config.RepoEntry {
@@ -204,12 +227,12 @@ func cmdStatus(configPath, token, repoFilter string) error {
 				}
 			}
 		}
-		for range obs.Droplets {
+		for range obs.Machines {
 			pending++
 		}
 		fmt.Printf("== %s ==\n  Q=%d QAge=%v 空闲runner=%d 忙runner=%d droplet=%d 未匹配排队=%d pending=%d complete=%v\n",
 			r.Repo, Q, QAge, idle, busy, pending, len(obs.UnmatchedQueued), obs.PendingJobs, obs.Complete)
-		for _, d := range obs.Droplets {
+		for _, d := range obs.Machines {
 			fmt.Printf("  droplet %-32s 创建于 %s\n", d.Name, d.CreatedAt.Format(time.RFC3339))
 		}
 	}
@@ -225,18 +248,9 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	if err != nil {
 		return err
 	}
-	vps := vpsctlapi.NewClient(cfg.VPSctlBin, cfg.VPSctlAccountsFile)
 	b := &budget.Budget{MaxDroplets: cfg.Global.MaxDroplets, DailyBudgetUSD: cfg.Global.DailyBudgetUSD}
-	accounts := map[string]bool{}
-	for _, r := range cfg.Repos {
-		accounts[cfg.ProfileOf(r).Account] = true
-	}
-	var accs []string
-	for a := range accounts {
-		accs = append(accs, a)
-	}
-	e.Gate = budget.NewGate(b, vps, accs) // 全局配额+预算互斥闸门（复审修正 8）
-	d := daemon.New(cfg, e, b, vps, log.Default())
+	e.Gate = budget.NewGate(b, e.Providers) // 全局配额+预算互斥闸门（复审修正 8；按池列机）
+	d := daemon.New(cfg, e, b, log.Default())
 	d.Usage = ghClient.SwapUsage // 每小时用量日志：requests/304/Remaining 首尾（V3 推法）
 	if dryRun {
 		fmt.Println("daemon -dry-run（shadow 模式）：只观察与决策，不执行任何动作")

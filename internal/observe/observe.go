@@ -1,6 +1,7 @@
-// Package observe 把 GitHub + vpsctl 的原始数据拼成 decide.Obs（§3.5）。
+// Package observe 把 GitHub + 机器提供商的原始数据拼成 decide.Obs（§3.5）。
 // 判据口径：job 粒度而非 run 粒度（P141——run 级 status 滞后，不可靠）；
 // label 匹配决定"哪些排队 job 算本执行面的需求"；机器侧信息不参与（§2.2 原则 1）。
+// 机器一路按池列机（machine.Provider.List），业务包不感知具体提供商。
 package observe
 
 import (
@@ -10,6 +11,7 @@ import (
 
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/machine"
 )
 
 // Job 是一个未完成 job 的观察快照（decide 的需求信号）。
@@ -32,28 +34,19 @@ type Runner struct {
 	Labels []string
 }
 
-// Droplet 是本仓 tag 下的 droplet。
-type Droplet struct {
-	ID           string
-	Name         string
-	CreatedAt    time.Time
-	PrivateIP    string
-	PublicIP     string
-	PriceMonthly float64
-}
-
-// Obs 是一轮观察（§3.5 结构）。
+// Obs 是一轮观察（§3.5 结构）。机器一路是提供商无关的 machine.Machine
+// （本仓 tag 下的机器，Pool/Addr/HourlyCost 由提供商给出）。
 type Obs struct {
 	Now      time.Time
-	Complete bool // 三路观察（runs+jobs / runners / droplets）全部成功
+	Complete bool // 三路观察（runs+jobs / runners / machines）全部成功
 	// 分路成败（观察冻结判据：哪一路失败冻结哪一路的行为，REDESIGN §2.2.7）
 	JobsOK          bool
 	RunnersOK       bool
-	DropletsOK      bool
+	MachinesOK      bool
 	Jobs            []Job
 	UnmatchedQueued []Job // labels 无法被 profile 满足的 queued job（场景 E）
 	Runners         []Runner
-	Droplets        []Droplet
+	Machines        []machine.Machine
 	// PendingJobs 是 status ∉ {queued, in_progress} 的未完 job 计数
 	// （waiting/requested/pending——不算需求，仅状态展示，§3.5 步骤 3）。
 	PendingJobs int
@@ -66,10 +59,9 @@ type GHSource interface {
 	ListRunners(ctx context.Context, repo string) ([]githubapp.Runner, error)
 }
 
-// VPSSource 是 observe 需要的 DO 侧能力（vpsctlapi 适配器在阶段 2③ 落地）。
-type VPSSource interface {
-	ListDroplets(ctx context.Context, tag, account string) ([]Droplet, error)
-}
+// PoolOf 返回某仓所用池的 Provider（cmd 装配；测试注入 fake）。
+// profile→池的解析属装配层：过渡期池名 = profile 名，池化配置后 = profile.pools[0]。
+type PoolOf func(r config.RepoEntry, p config.Profile) machine.Provider
 
 // JobCacheEntry 是 webhook 送来的 job 快照（§3.4.5：只用于补齐 run 列表
 // 尚未反映的刚出现 job；条目 2 小时过期，同 job id 以 updated 更新者为准）。
@@ -80,10 +72,10 @@ type JobCacheEntry struct {
 
 // Collector 采集一个仓的一轮观察。
 type Collector struct {
-	GH    GHSource
-	VPS   VPSSource
-	Cache *JobCache // webhook job 缓存（可为 nil）
-	Now   func() time.Time
+	GH     GHSource
+	PoolOf PoolOf    // 仓 → 池 Provider（机器一路）
+	Cache  *JobCache // webhook job 缓存（可为 nil）
+	Now    func() time.Time
 }
 
 // JobCache 是按 job id 的 webhook 快照缓存。
@@ -130,16 +122,16 @@ func Matchable(jobLabels []string, p config.Profile) bool {
 }
 
 // Collect 采集一个仓：近 24h 未完成 run → 逐 run jobs（filter=latest）→
-// 合并 webhook 缓存 → 状态过滤 → label 匹配 → runners → droplets。
+// 合并 webhook 缓存 → 状态过滤 → label 匹配 → runners → 按仓 tag 列机器。
 // 任一路失败：该路之后的相关字段留空、Complete=false，其余路照采（§3.5
-// 步骤 7——decide 对不完整观察只建不删，§2.2 原则 7）；首错随 Obs 返回供日志。
+// 步骤 7——decide 对不完整观察整轮冻结，§2.2 原则 7）；首错随 Obs 返回供日志。
 func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Profile) (Obs, error) {
 	repo := r.Repo
 	now := time.Now()
 	if c.Now != nil {
 		now = c.Now()
 	}
-	obs := Obs{Now: now, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	obs := Obs{Now: now, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 	var firstErr error
 	fail := func(err error, leg *bool) {
 		obs.Complete = false
@@ -205,11 +197,11 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 		}
 	}
 
-	droplets, err := c.VPS.ListDroplets(ctx, r.Tag(), p.Account)
+	machines, err := c.PoolOf(r, p).List(ctx, r.Tag())
 	if err != nil {
-		fail(err, &obs.DropletsOK)
+		fail(err, &obs.MachinesOK)
 	} else {
-		obs.Droplets = droplets
+		obs.Machines = machines
 	}
 	return obs, firstErr
 }

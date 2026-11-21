@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
@@ -19,7 +20,7 @@ func TestFreezeRunnersLegFailureNoKill(t *testing.T) {
 		o.Complete = false
 		o.RunnersOK = false
 		o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "in_progress", CreatedAt: t0.Add(-30 * time.Minute), StartedAt: t0.Add(-30 * time.Minute), RunnerName: name}}
-		o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
+		o.Machines = []machine.Machine{droplet(name, 2*time.Hour)}
 		// Runners 为空（一路失败）
 		var acts []Action
 		acts, st = Decide(params(), st, o)
@@ -43,7 +44,7 @@ func TestFreezeRunnersLegFailureNoKill(t *testing.T) {
 	// 恢复完整观察：健康忙碌机器无任何动作
 	o := obs()
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "in_progress", CreatedAt: t0.Add(-30 * time.Minute), StartedAt: t0.Add(-30 * time.Minute), RunnerName: name}}
-	o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, 2*time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, true)}
 	acts, _ := Decide(params(), st, o)
 	if n := len(acts); n > 0 {
@@ -60,7 +61,7 @@ func TestFreezeDropletsLegFailureNoOvercreate(t *testing.T) {
 	}}}
 	o := obs()
 	o.Complete = false
-	o.DropletsOK = false
+	o.MachinesOK = false
 	o.Jobs = []observe.Job{queuedJob(1, time.Minute), queuedJob(2, time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	acts, st2 := Decide(params(), st, o)
@@ -82,7 +83,7 @@ func TestFreezeJobsLegFailure(t *testing.T) {
 	o := obs()
 	o.Complete = false
 	o.JobsOK = false
-	o.Droplets = []observe.Droplet{droplet(name, 30*time.Minute)}
+	o.Machines = []machine.Machine{droplet(name, 30*time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{ObserveFailStreak: 9, Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-30 * time.Minute)}}}
 	acts, st2 := Decide(params(), st, o)

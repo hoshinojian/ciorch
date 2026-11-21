@@ -20,6 +20,14 @@ jobs:
           go-version-file: go.mod
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
+      # import 边界（实施计划 §3.6）：除提供商实现包自身与 cmd/（装配层）
+      # 外，任何包不得 import 提供商实现。-test 连测试文件依赖一并检查。
+      - name: import 边界检查
+        run: |
+          ! go list -test -f '{{.ImportPath}}: {{join .Imports " "}}' ./... \
+            | grep -v '^github.com/hoshinojian/ciorch/internal/provider/' \
+            | grep -v '^github.com/hoshinojian/ciorch/cmd/' \
+            | grep 'internal/provider/'
 
   test:
     runs-on: ubuntu-latest

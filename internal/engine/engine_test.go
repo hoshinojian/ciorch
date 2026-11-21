@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,11 +15,36 @@ import (
 	"github.com/hoshinojian/ciorch/internal/config"
 	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/githubapp"
+	"github.com/hoshinojian/ciorch/internal/machine"
+	"github.com/hoshinojian/ciorch/internal/machine/machinetest"
 	"github.com/hoshinojian/ciorch/internal/observe"
-	"github.com/hoshinojian/ciorch/internal/vpsctlapi"
 )
 
 var tnow = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+// legacyNamer 复刻 vpsctl 池的命名格式（{prefix}-{account}-{region}-NN），
+// 让本文件沿用的机器名字面量（ci-nms-team2-ci-sgp1-01 等）继续成立。
+type legacyNamer struct{ account, region string }
+
+func (n legacyNamer) Next(prefix string, existing []string) string {
+	pre := fmt.Sprintf("%s-%s-%s-", prefix, n.account, n.region)
+	max := 0
+	for _, name := range existing {
+		suffix, ok := strings.CutPrefix(name, pre)
+		if !ok {
+			continue
+		}
+		var num int
+		if _, err := fmt.Sscanf(suffix, "%d", &num); err == nil && num > max {
+			max = num
+		}
+	}
+	return fmt.Sprintf("%s%02d", pre, max+1)
+}
+
+func (n legacyNamer) Pattern(prefix string) string {
+	return fmt.Sprintf(`^%s-%s-%s-\d{2}$`, prefix, n.account, n.region)
+}
 
 // ---------- fakes ----------
 
@@ -57,41 +80,6 @@ func (f *fakeGH) ListRunners(ctx context.Context, repo string) ([]githubapp.Runn
 	return f.listRunners, nil
 }
 
-type fakeVPS struct {
-	created   []vpsctlapi.CreateOpts
-	deleted   []string
-	order     []string
-	createErr error
-	droplets  []vpsctlapi.Droplet // ListByTag 结果
-}
-
-func (f *fakeVPS) Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error) {
-	if f.createErr != nil {
-		return vpsctlapi.Droplet{}, f.createErr
-	}
-	f.created = append(f.created, o)
-	f.order = append(f.order, "create")
-	return vpsctlapi.Droplet{Account: o.Account, ID: fmt.Sprintf("id%d", len(f.created)), Name: "ci-nms-team2-ci-sgp1-01"}, nil
-}
-func (f *fakeVPS) Delete(ctx context.Context, account, id string) error {
-	f.deleted = append(f.deleted, id)
-	f.order = append(f.order, "delete:"+id)
-	return nil
-}
-func (f *fakeVPS) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
-	// 贴近 vpsctl 契约：按 tag 精确过滤
-	var out []vpsctlapi.Droplet
-	for _, d := range f.droplets {
-		for _, tg := range d.Tags {
-			if tg == tag {
-				out = append(out, d)
-				break
-			}
-		}
-	}
-	return out, nil
-}
-
 type fakeSSH struct{ acts []string }
 
 func (f *fakeSSH) Act(ctx context.Context, ip, action string) ([]byte, error) {
@@ -123,15 +111,30 @@ func testCfg(t *testing.T) *config.Config {
 	}
 }
 
-func newEngine(t *testing.T, gh *fakeGH, vps *fakeVPS, obsrv Observer) *Engine {
+// newFakePool 构造一个 vpsctl 命名格式的 fake 池（池名 = profile 名，同装配层过渡桥）。
+func newFakePool() *machinetest.Fake {
+	f := machinetest.NewFake("go-heavy")
+	f.NamerImpl = legacyNamer{account: "team2-ci", region: "sgp1"}
+	f.Now = func() time.Time { return tnow }
+	return f
+}
+
+func newEngine(t *testing.T, gh *fakeGH, pool *machinetest.Fake, obsrv Observer) *Engine {
 	t.Helper()
-	e := New(testCfg(t), gh, vps, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": pool}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := New(testCfg(t), gh, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(obsrv)
 	return e
 }
 
 func nmsRepo() config.RepoEntry {
 	return config.RepoEntry{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2}
+}
+
+func mkMachine(id, name string, age time.Duration) machine.Machine {
+	return machine.Machine{Pool: "go-heavy", ID: id, Name: name, CreatedAt: tnow.Add(-age),
+		Addr: "10.0.0.1", HourlyCost: 141.0 / 672.0, Tags: []string{"ciorch"}}
 }
 
 // ---------- §8.1 engine 条目 ----------
@@ -143,19 +146,19 @@ func TestExecuteOrderDeleteBeforeCreate(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		o.Jobs = append(o.Jobs, observe.Job{ID: int64(i), RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)})
 	}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour), PrivateIP: "10.0.0.1"}}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
 	gh := &fakeGH{}
-	vps := &fakeVPS{}
+	pool := newFakePool()
 	// 预置状态：机器早已 online 且空闲 30m（硬寿命 9h → Drain；Q=5 → Create）
 	st := preloadState(gh, name)
-	e := newEngine(t, gh, vps, &fakeObs{o})
+	e := newEngine(t, gh, pool, &fakeObs{o})
 	e.States[nmsRepo().Repo] = st
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
-	if len(vps.order) < 2 || !strings.HasPrefix(vps.order[0], "delete:") || vps.order[1] != "create" {
-		t.Fatalf("删应在建前：order=%v", vps.order)
+	if len(pool.Events) < 2 || !strings.HasPrefix(pool.Events[0], "delete:") || !strings.HasPrefix(pool.Events[1], "create:") {
+		t.Fatalf("删应在建前：events=%v", pool.Events)
 	}
 }
 
@@ -163,17 +166,17 @@ func TestExecuteOrderDeleteBeforeCreate(t *testing.T) {
 func TestDrainRegistrationFailureKeepsMachine(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := observe.Obs{Now: tnow, Complete: true}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour)}}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
 	gh := &fakeGH{removeErr: map[int64]error{42: fmt.Errorf("422 Cannot delete a runner that is busy")}}
-	vps := &fakeVPS{}
-	e := newEngine(t, gh, vps, &fakeObs{o})
+	pool := newFakePool()
+	e := newEngine(t, gh, pool, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
-	if len(vps.deleted) != 0 {
-		t.Fatalf("注销失败不应删机：deleted=%v", vps.deleted)
+	if len(pool.Deleted) != 0 {
+		t.Fatalf("注销失败不应删机：deleted=%v", pool.Deleted)
 	}
 }
 
@@ -184,61 +187,61 @@ func TestActionIsolation(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		o.Jobs = append(o.Jobs, observe.Job{ID: int64(i), RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)})
 	}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour), PrivateIP: "10.0.0.1"}}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
 	gh := &fakeGH{removeErr: map[int64]error{42: fmt.Errorf("boom")}}
-	vps := &fakeVPS{}
-	e := newEngine(t, gh, vps, &fakeObs{o})
+	pool := newFakePool()
+	e := newEngine(t, gh, pool, &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(gh, name)
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
-	if len(vps.created) != 1 {
-		t.Fatalf("一个动作失败不应拖垮同轮其他动作：created=%v", vps.created)
+	if len(pool.Created) != 1 {
+		t.Fatalf("一个动作失败不应拖垮同轮其他动作：created=%v", pool.Created)
 	}
 }
 
-// 建机失败保留 user-data（诊断用）；成功即删（含 1h token）。
-func TestCreateUserDataLifecycle(t *testing.T) {
+// 建机请求经 Provider：名字由池 Namer 取、cloud-init 原样传入、tags 含公共与仓标记；
+// 建机失败回填退避（场景 I）。user-data 落盘/清理是 Provider 职责
+// （见 internal/provider/vpsctl 的 TestUserDataLifecycle）。
+func TestCreateRequestAndFailureBackoff(t *testing.T) {
 	o := observe.Obs{Now: tnow, Complete: true}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
-	cfg := testCfg(t)
 
-	// 失败：文件保留
-	gh := &fakeGH{}
-	vps := &fakeVPS{createErr: fmt.Errorf("DO 503")}
-	e := New(cfg, gh, vps, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
-	e.SetCollector(&fakeObs{o})
+	// 失败：回填 CreateFailStreak
+	pool := newFakePool()
+	pool.CreateErr = fmt.Errorf("DO 503")
+	e := newEngine(t, &fakeGH{}, pool, &fakeObs{o})
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
-	files, _ := filepath.Glob(filepath.Join(cfg.StateDir, "cloudinit", "*.yaml"))
-	if len(files) != 1 {
-		t.Fatalf("建机失败应保留 user-data：files=%v", files)
-	}
-	// 退避入账（场景 I）
 	if e.States[nmsRepo().Repo].CreateFailStreak != 1 {
 		t.Fatalf("失败应回填 CreateFailStreak=1，got %+v", e.States[nmsRepo().Repo])
 	}
 
-	// 成功：文件删除；空 IP 不是错误
-	vps2 := &fakeVPS{}
-	e2 := New(testCfg(t), &fakeGH{}, vps2, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
-	e2.SetCollector(&fakeObs{o})
+	// 成功：请求内容完整、名字跳号正确
+	pool2 := newFakePool()
+	pool2.Seed(mkMachine("d1", "ci-nms-team2-ci-sgp1-01", time.Hour))
+	e2 := newEngine(t, &fakeGH{}, pool2, &fakeObs{o})
+	o2 := o
+	o2.Machines = []machine.Machine{mkMachine("d1", "ci-nms-team2-ci-sgp1-01", time.Hour)}
+	e2.SetCollector(&fakeObs{o2})
 	if _, _, err := e2.Reconcile(context.Background(), nmsRepo(), false); err != nil {
 		t.Fatal(err)
 	}
-	if len(vps2.created) != 1 {
-		t.Fatalf("应建 1 台：%v", vps2.created)
+	if len(pool2.Created) != 1 {
+		t.Fatalf("应建 1 台：%v", pool2.Created)
 	}
-	if got := vps2.created[0]; !strings.Contains(strings.Join(got.Tags, ","), "ciorch") {
-		t.Fatalf("建机 tags 应含公共 tag：%v", got.Tags)
+	req := pool2.Created[0]
+	if req.Name != "ci-nms-team2-ci-sgp1-02" {
+		t.Fatalf("名字应跳号取 02：%q", req.Name)
 	}
-	files2, _ := filepath.Glob(filepath.Join(e2.stateDirOrDefault(), "cloudinit", "*.yaml"))
-	if len(files2) != 0 {
-		t.Fatalf("建机成功应删 user-data：%v", files2)
+	if string(req.UserData) != "#cloud-config\n" || len(req.UserData) == 0 {
+		t.Fatalf("cloud-init 应原样传入：%q", req.UserData)
 	}
-	_ = os.Remove(filepath.Join(cfg.StateDir, "cloudinit", "ci-nms-team2-ci-sgp1-01.yaml"))
+	if got := strings.Join(req.Tags, ","); !strings.Contains(got, "ciorch") || !strings.Contains(got, nmsRepo().Tag()) {
+		t.Fatalf("建机 tags 应含公共与仓 tag：%v", req.Tags)
+	}
 }
 
 // dry-run：只决策不执行。
@@ -246,27 +249,25 @@ func TestDryRunExecutesNothing(t *testing.T) {
 	o := observe.Obs{Now: tnow, Complete: true}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
 	gh := &fakeGH{}
-	vps := &fakeVPS{}
-	e := newEngine(t, gh, vps, &fakeObs{o})
+	pool := newFakePool()
+	e := newEngine(t, gh, pool, &fakeObs{o})
 	acts, _, err := e.Reconcile(context.Background(), nmsRepo(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(acts) == 0 || len(vps.created) != 0 || len(gh.removed) != 0 {
-		t.Fatalf("dry-run 不执行：acts=%v created=%v", acts, vps.created)
+	if len(acts) == 0 || len(pool.Created) != 0 || len(gh.removed) != 0 {
+		t.Fatalf("dry-run 不执行：acts=%v created=%v", acts, pool.Created)
 	}
 }
 
-// 场景 J：孤儿 droplet（公共 tag、无仓 tag）只报告，绝不删。
+// 场景 J：孤儿机器（公共标记、无仓标记）只报告，绝不删。
 func TestOrphansReportedNeverDeleted(t *testing.T) {
-	cfg := testCfg(t)
 	repoTag := nmsRepo().Tag()
-	vps := &fakeVPS{droplets: []vpsctlapi.Droplet{
-		{Account: "team2-ci", ID: "1", Name: "mystery-01", Tags: []string{"ciorch"}},                       // 孤儿
-		{Account: "team2-ci", ID: "2", Name: "ci-nms-team2-ci-sgp1-01", Tags: []string{"ciorch", repoTag}}, // 正常
-		{Account: "team2-ci", ID: "3", Name: "ciorch-host-1", Tags: []string{"ciorch-host"}},               // 编排器自身（不列出来）
-	}}
-	e := New(cfg, &fakeGH{}, vps, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	pool := newFakePool()
+	pool.Seed(machine.Machine{Pool: "go-heavy", ID: "1", Name: "mystery-01", Tags: []string{"ciorch"}})                       // 孤儿
+	pool.Seed(machine.Machine{Pool: "go-heavy", ID: "2", Name: "ci-nms-team2-ci-sgp1-01", Tags: []string{"ciorch", repoTag}}) // 正常
+	pool.Seed(machine.Machine{Pool: "go-heavy", ID: "3", Name: "ciorch-host-1", Tags: []string{"ciorch-host"}})               // 编排器自身（公共标记列表不出）
+	e := New(testCfg(t), &fakeGH{}, map[string]machine.Provider{"go-heavy": pool}, nil, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	orphans, err := e.ScanOrphans(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +275,7 @@ func TestOrphansReportedNeverDeleted(t *testing.T) {
 	if len(orphans) != 1 || orphans[0].ID != "1" {
 		t.Fatalf("应只识别 1 台孤儿：%+v", orphans)
 	}
-	if len(vps.deleted) != 0 {
+	if len(pool.Deleted) != 0 {
 		t.Fatal("孤儿绝不删除")
 	}
 }
@@ -297,12 +298,14 @@ func TestConcurrentReposNoRace(t *testing.T) {
 	}
 	// 复审复现条件：观察里有机器（Machines map 会被写），两仓并发 200 轮
 	mname := "ci-nms-team2-ci-sgp1-01"
-	obsrv := &fakeObs{observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true,
-		Droplets: []observe.Droplet{{ID: "d1", Name: mname, CreatedAt: tnow.Add(-30 * time.Minute), PriceMonthly: 141}},
+	obsrv := &fakeObs{observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true,
+		Machines: []machine.Machine{mkMachine("d1", mname, 30*time.Minute)},
 		Runners:  []observe.Runner{{ID: 42, Name: mname, Status: "online", Busy: false}},
 		Jobs:     []observe.Job{{ID: 1, RunID: 1, Status: "in_progress", CreatedAt: tnow.Add(-20 * time.Minute), StartedAt: tnow.Add(-20 * time.Minute), RunnerName: mname}},
 	}}
-	e := New(cfg, &fakeGH{}, &fakeVPS{}, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	pool := newFakePool()
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return pool }
+	e := New(cfg, &fakeGH{}, map[string]machine.Provider{"go-heavy": pool}, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(obsrv)
 	var wg sync.WaitGroup
 	for _, r := range cfg.Repos {
@@ -329,15 +332,18 @@ func TestGateSingleSlotTwoRepos(t *testing.T) {
 		{Repo: "hoshinojian/web", Profile: "go-heavy", MaxRunners: 2},
 	}
 	// 全局已有 1 台（max=2，剩 1 名额）；list 反映 create/delete
-	cl := &cluster{droplets: []vpsctlapi.Droplet{{Account: "team2-ci", ID: "9", Name: "ci-x-team2-ci-sgp1-01", PriceMonthly: 141}}}
+	cl := &cluster{}
+	cl.seed(machine.Machine{Pool: "go-heavy", ID: "9", Name: "ci-x-team2-ci-sgp1-01", HourlyCost: 141.0 / 672.0, Tags: []string{"ciorch"}})
 	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
-	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
 	gate.Now = func() time.Time { return tnow }
 
-	e := New(cfg, &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": cl}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	// 两仓并发各跑一轮（每仓 Q=3 会想建 2 台；全局只剩 1 名额）
-	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}, {ID: 2, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}, {ID: 3, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
 	e.SetCollector(&fakeObs{o})
 	var wg sync.WaitGroup
@@ -360,16 +366,19 @@ func TestGateSingleSlotTwoRepos(t *testing.T) {
 func TestGateBudgetDenialIncidentF(t *testing.T) {
 	cfg := testCfg(t)
 	// 已有机器花掉了预算：1 台 141/672×2h≈0.42，日预算 0.5 → 新机 1 小时 0.21 会超
-	cl := &cluster{droplets: []vpsctlapi.Droplet{{Account: "team2-ci", ID: "9", Name: "ci-x-team2-ci-sgp1-01", PriceMonthly: 141, CreatedAt: tnow.Add(-2 * time.Hour)}}}
+	cl := &cluster{}
+	cl.seed(machine.Machine{Pool: "go-heavy", ID: "9", Name: "ci-x-team2-ci-sgp1-01", HourlyCost: 141.0 / 672.0, CreatedAt: tnow.Add(-2 * time.Hour), Tags: []string{"ciorch"}})
 	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 0.5}
-	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
 	gate.Now = func() time.Time { return tnow }
 
 	incidents := []decide.Action{}
-	e := New(cfg, &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": cl}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	e.OnIncident = func(ctx context.Context, repo string, a decide.Action) { incidents = append(incidents, a) }
-	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-16 * time.Minute)}}
 	e.SetCollector(&fakeObs{o})
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
@@ -385,13 +394,15 @@ func TestDrainRecordsDeletionToBudget(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	cl := &cluster{}
 	b := &budget.Budget{MaxDroplets: 2, DailyBudgetUSD: 100}
-	gate := budget.NewGate(b, cl, []string{"team2-ci"})
+	gate := budget.NewGate(b, map[string]machine.Provider{"go-heavy": cl})
 	gate.Now = func() time.Time { return tnow }
 
-	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour), PriceMonthly: 141}}
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
-	e := New(testCfg(t), &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": cl}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := New(testCfg(t), &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.Gate = gate
 	e.SetCollector(&fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(nil, name)
@@ -406,41 +417,58 @@ func TestDrainRecordsDeletionToBudget(t *testing.T) {
 	}
 }
 
-// cluster 模拟 DO 全局状态：list 反映 create/delete（并发安全）——
-// 现实中 vpsctl list 会立刻见到新机器，闸门才数得准。
+// cluster 模拟一个池的全局状态：list 反映 create/delete（并发安全）——
+// 现实中 provider 列表会立刻见到新机器，闸门才数得准。
 type cluster struct {
 	mu       sync.Mutex
-	droplets []vpsctlapi.Droplet
+	machines []machine.Machine
 	created  int
 	deleted  []string
 }
 
-func (c *cluster) ListByTag(ctx context.Context, tag, account string) ([]vpsctlapi.Droplet, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]vpsctlapi.Droplet(nil), c.droplets...), nil
+func (c *cluster) seed(m machine.Machine) { c.machines = append(c.machines, m) }
+
+func (c *cluster) Kind() string { return "cluster" }
+func (c *cluster) Namer() machine.Namer {
+	return legacyNamer{account: "team2-ci", region: "sgp1"}
 }
 
-func (c *cluster) Create(ctx context.Context, o vpsctlapi.CreateOpts) (vpsctlapi.Droplet, error) {
+func (c *cluster) List(ctx context.Context, tag string) ([]machine.Machine, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []machine.Machine
+	for _, m := range c.machines {
+		for _, tg := range m.Tags {
+			if tg == tag {
+				out = append(out, m)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (c *cluster) Create(ctx context.Context, req machine.CreateRequest) (machine.Machine, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.created++
-	d := vpsctlapi.Droplet{Account: o.Account, ID: fmt.Sprintf("new-%d", c.created), Name: "ci-nms-team2-ci-sgp1-09", PriceMonthly: 141}
-	c.droplets = append(c.droplets, d)
-	return d, nil
+	m := machine.Machine{Pool: "go-heavy", ID: fmt.Sprintf("new-%d", c.created), Name: "ci-nms-team2-ci-sgp1-09",
+		CreatedAt: tnow, HourlyCost: 141.0 / 672.0, Tags: req.Tags}
+	c.machines = append(c.machines, m)
+	return m, nil
 }
 
-func (c *cluster) Delete(ctx context.Context, account, id string) error {
+func (c *cluster) Delete(ctx context.Context, id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleted = append(c.deleted, id)
-	var out []vpsctlapi.Droplet
-	for _, d := range c.droplets {
-		if d.ID != id {
-			out = append(out, d)
+	var out []machine.Machine
+	for _, m := range c.machines {
+		if m.ID != id {
+			out = append(out, m)
 		}
 	}
-	c.droplets = out
+	c.machines = out
 	return nil
 }
 
@@ -448,11 +476,13 @@ func (c *cluster) Delete(ctx context.Context, account, id string) error {
 // 注销失败，机器删不掉）。
 func TestDrainWithoutRegistrationDeletesDirectly(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
-	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-9 * time.Hour)}}
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
 	// 无任何注册（Runners 空 → decide 的 Drain 带 RunnerID=0）
 	cl := &cluster{}
-	e := New(testCfg(t), &fakeGH{}, cl, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	providers := map[string]machine.Provider{"go-heavy": cl}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+	e := New(testCfg(t), &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
 	e.SetCollector(&fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(nil, name)
 	if _, _, err := e.Reconcile(context.Background(), nmsRepo(), false); err != nil {
@@ -466,14 +496,14 @@ func TestDrainWithoutRegistrationDeletesDirectly(t *testing.T) {
 // 顺手修：Reconcile 带回 Q/QAge/I/P/N（§3.9 摘要行数据源）。
 func TestReconcileReturnsStats(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
-	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 	o.Jobs = []observe.Job{
 		{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-3 * time.Minute)},
 		{ID: 2, RunID: 1, Status: "in_progress", CreatedAt: tnow.Add(-2 * time.Minute), StartedAt: tnow.Add(-2 * time.Minute)},
 	}
-	o.Droplets = []observe.Droplet{{ID: "d1", Name: name, CreatedAt: tnow.Add(-10 * time.Minute)}}
+	o.Machines = []machine.Machine{mkMachine("d1", name, 10*time.Minute)}
 	o.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
-	e := newEngine(t, &fakeGH{}, &fakeVPS{}, &fakeObs{o})
+	e := newEngine(t, &fakeGH{}, newFakePool(), &fakeObs{o})
 	e.States[nmsRepo().Repo] = preloadState(nil, name)
 	_, stats, err := e.Reconcile(context.Background(), nmsRepo(), true)
 	if err != nil {
@@ -482,4 +512,71 @@ func TestReconcileReturnsStats(t *testing.T) {
 	if stats.Q != 1 || stats.QAge != 3*time.Minute || stats.I != 1 || stats.N != 1 {
 		t.Fatalf("stats 不对: %+v", stats)
 	}
+}
+
+// §6（实施计划）：两个池时建机/删机路由到正确的 provider、孤儿扫描覆盖所有池。
+func TestTwoPoolsRouteToProviders(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.Profiles["go-light"] = config.Profile{Account: "team2-ci", Region: "sgp1", Size: "s-1vcpu-2gb", Image: "ubuntu-24-04-x64", Labels: []string{"ci"}, RunnersPerDroplet: 1}
+	cfg.Repos = []config.RepoEntry{
+		{Repo: "hoshinojian/nms", Profile: "go-heavy", MaxRunners: 2},
+		{Repo: "hoshinojian/web", Profile: "go-light", MaxRunners: 2},
+	}
+	poolHeavy, poolLight := newFakePool(), newFakePool()
+	poolLight.Pool = "go-light"
+	providers := map[string]machine.Provider{"go-heavy": poolHeavy, "go-light": poolLight}
+	poolOf := func(r config.RepoEntry, p config.Profile) machine.Provider { return providers[r.Profile] }
+
+	// nms 建机 → go-heavy；web 建机 → go-light
+	oNms := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	oNms.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	oWeb := oNms
+	oWeb.Jobs = []observe.Job{{ID: 9, RunID: 2, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	e := New(cfg, &fakeGH{}, providers, poolOf, &fakeSSH{}, fakeRenderer{}, log.New(io.Discard, "", 0))
+	e.SetCollector(&routeObs{byRepo: map[string]observe.Obs{"hoshinojian/nms": oNms, "hoshinojian/web": oWeb}})
+	for _, r := range cfg.Repos {
+		if _, _, err := e.Reconcile(context.Background(), r, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(poolHeavy.Created) != 1 || len(poolLight.Created) != 1 {
+		t.Fatalf("各池应各建 1 台：heavy=%v light=%v", poolHeavy.Created, poolLight.Created)
+	}
+
+	// 删机按机器 Pool 路由：nms 的硬寿命机在 go-heavy 池
+	name := "ci-nms-team2-ci-sgp1-01"
+	oDrain := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	oDrain.Machines = []machine.Machine{mkMachine("d1", name, 9*time.Hour)}
+	oDrain.Runners = []observe.Runner{{ID: 42, Name: name, Status: "online", Busy: false}}
+	e.SetCollector(&fakeObs{oDrain})
+	e.States["hoshinojian/nms"] = preloadState(nil, name)
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], false); err != nil {
+		t.Fatal(err)
+	}
+	if len(poolHeavy.Deleted) != 1 || len(poolLight.Deleted) != 0 {
+		t.Fatalf("删机应路由到所属池：heavy=%v light=%v", poolHeavy.Deleted, poolLight.Deleted)
+	}
+
+	// 孤儿扫描覆盖所有池
+	poolLight.Seed(machine.Machine{Pool: "go-light", ID: "orphan-1", Name: "mystery-02", Tags: []string{"ciorch"}})
+	orphans, err := e.ScanOrphans(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range orphans {
+		if m.ID == "orphan-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("孤儿扫描应覆盖全部池：%+v", orphans)
+	}
+}
+
+// routeObs 按仓返回不同观察（两池路由测试用）。
+type routeObs struct{ byRepo map[string]observe.Obs }
+
+func (r *routeObs) Collect(ctx context.Context, re config.RepoEntry, p config.Profile) (observe.Obs, error) {
+	return r.byRepo[re.Repo], nil
 }

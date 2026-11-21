@@ -28,12 +28,12 @@ func hardLifetime(p Params, st *RepoState, obs observe.Obs, views map[string]*ma
 		if ms.Bad || ms.Remedy != "" {
 			continue // 已判死由 handleBadMachines 重发；同轮已有回收动作的不重复发
 		}
-		age := obs.Now.Sub(m.droplet.CreatedAt)
+		age := obs.Now.Sub(m.mach.CreatedAt)
 		if age >= p.MaxLifetime && !m.anyBusy() {
 			ms.Remedy, ms.RemedyAt = "draining", obs.Now
 			st.Machines[name] = ms
 			emit(Action{
-				Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+				Kind: ActDrain, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 				Reason: "硬寿命到期：机器年龄超上限且回收窗口（观察不完整也执行，防成本泄漏）",
 			})
 		} else if age >= p.MaxLifetime+lifetimeOverrunAlert {
@@ -59,7 +59,7 @@ func handleBadMachines(st *RepoState, obs observe.Obs, views map[string]*machine
 				reason = "已判死机器：重试回收（先注销后删，droplet 仍在列表）"
 			}
 			emit(Action{
-				Kind: kind, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+				Kind: kind, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 				Reason: reason,
 			})
 			continue
@@ -72,7 +72,7 @@ func handleBadMachines(st *RepoState, obs observe.Obs, views map[string]*machine
 				ms.Bad = true
 				st.Machines[name] = ms
 				emit(Action{
-					Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name,
+					Kind: ActDrain, DropletID: m.mach.ID, DropletName: name,
 					Reason: "Drain 已注销、删机未生效：重试删除（非掉线，不记事件）",
 				})
 			} else {
@@ -111,7 +111,7 @@ func scenarioC(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
 		st.Machines[name] = ms
 		emit(Action{
-			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+			Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 			Reason: "场景 C 掉线：offline 连续命中，判死强删（先删机再清注册）",
 		})
 		if countRecent(st.OfflineEvents, obs.Now, stallHistoryWindow) >= 2 {
@@ -133,7 +133,7 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		if !ms.FirstOnlineAt.IsZero() {
 			continue // 曾 online 的掉线归 C
 		}
-		age := obs.Now.Sub(m.droplet.CreatedAt)
+		age := obs.Now.Sub(m.mach.CreatedAt)
 		if age < p.ColdStartTimeout {
 			continue // 冷启窗口内，再等
 		}
@@ -147,7 +147,7 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		ms.Remedy, ms.RemedyAt = "replacing", obs.Now
 		st.Machines[name] = ms
 		emit(Action{
-			Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+			Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 			Reason: "场景 B 冷启失败：droplet 超龄且 runner 从未上线，强删（注册从未成功或残留一并清）",
 		})
 		// 熔断计数（C 不计入）
@@ -194,7 +194,7 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 				ms.Remedy = "draining"
 				st.Machines[name] = ms
 				emit(Action{
-					Kind: ActDrain, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+					Kind: ActDrain, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 					Reason: "场景 A 假活：重启观察窗后仍不接活，判死回收（先注销后删机）",
 				})
 				remedied[name] = true
@@ -278,7 +278,7 @@ func scenarioD(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			ms.Remedy, ms.RemedyAt = "draining", obs.Now
 			st.Machines[name] = ms
 			emit(Action{
-				Kind: ActForceDelete, DropletID: m.droplet.ID, DropletName: name, RunnerID: firstRunnerID(m),
+				Kind: ActForceDelete, DropletID: m.mach.ID, DropletName: name, RunnerID: firstRunnerID(m),
 				Reason: "场景 D job 卡死：job 持续超击杀线，强删机器（先删机再清注册，job 已判死）",
 			})
 		}
@@ -397,7 +397,7 @@ func scaling(p Params, st *RepoState, obs observe.Obs, views map[string]*machine
 			ms.Remedy, ms.RemedyAt = "draining", obs.Now
 			st.Machines[oldestName] = ms
 			emit(Action{
-				Kind: ActDrain, DropletID: views[oldestName].droplet.ID, DropletName: oldestName,
+				Kind: ActDrain, DropletID: views[oldestName].mach.ID, DropletName: oldestName,
 				RunnerID: firstRunnerID(views[oldestName]),
 				Reason:   "空闲回收：无排队且 runner 空闲超时（一轮只回收最老一台）",
 			})

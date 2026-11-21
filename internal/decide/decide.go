@@ -10,12 +10,12 @@
 package decide
 
 import (
-	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
@@ -44,7 +44,7 @@ type Action struct {
 	Reason       string
 }
 
-// MachineState 是单台机器的跨轮记忆（§3.6.1，key = droplet 名）。
+// MachineState 是单台机器的跨轮记忆（§3.6.1，key = 机器名）。
 type MachineState struct {
 	FirstSeen      time.Time // 编排器首次看到该 droplet
 	FirstOnlineAt  time.Time // runner 首次 online
@@ -182,28 +182,10 @@ func (p *Params) fillDefaults() {
 	}
 }
 
-// NextName 计算下一台 droplet 名：现存同名空间最大序号 +1（跳号——被删机器
-// 的序号不回收；§8.1 命名条目）。
-func NextName(prefix, account, region string, existing []observe.Droplet) string {
-	pre := fmt.Sprintf("%s-%s-%s-", prefix, account, region)
-	max := 0
-	for _, d := range existing {
-		suffix, ok := strings.CutPrefix(d.Name, pre)
-		if !ok {
-			continue // 外部前缀/不同区域，不占本区序号
-		}
-		var n int
-		if _, err := fmt.Sscanf(suffix, "%d", &n); err == nil && n > max {
-			max = n
-		}
-	}
-	return fmt.Sprintf("%s%02d", pre, max+1)
-}
-
 // machineView 是 Decide 内部的机器视图。
 type machineView struct {
 	name    string
-	droplet observe.Droplet
+	mach    machine.Machine
 	runners []observe.Runner // 本命名空间内、名字对得上本机的注册
 	online  int
 	idle    int // online 且 busy=false
@@ -244,7 +226,7 @@ func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 	// 采样计数、不清理 Machines 记忆。
 	if !obs.Complete {
 		scenarioH(p, &st, obs, emit)
-		if obs.DropletsOK {
+		if obs.MachinesOK {
 			syncMachines(&st, obs)
 			views := buildViewsFrozen(obs)
 			hardLifetime(p, &st, obs, views, emit)
@@ -287,8 +269,8 @@ func Decide(p Params, st RepoState, obs observe.Obs) ([]Action, RepoState) {
 // buildViewsFrozen 组装只读视图（不更新任何机器状态——冻结轮专用）。
 func buildViewsFrozen(obs observe.Obs) map[string]*machineView {
 	views := map[string]*machineView{}
-	for _, d := range obs.Droplets {
-		views[d.Name] = &machineView{name: d.Name, droplet: d}
+	for _, d := range obs.Machines {
+		views[d.Name] = &machineView{name: d.Name, mach: d}
 	}
 	return views
 }
@@ -322,8 +304,8 @@ func cloneState(st RepoState) RepoState {
 // buildViews 组装机器视图并维护 IdleSince/BusySince/OfflineSamples/FirstOnlineAt。
 func buildViews(p Params, st *RepoState, obs observe.Obs) map[string]*machineView {
 	views := map[string]*machineView{}
-	for _, d := range obs.Droplets {
-		m := &machineView{name: d.Name, droplet: d}
+	for _, d := range obs.Machines {
+		m := &machineView{name: d.Name, mach: d}
 		for _, r := range obs.Runners {
 			if p.OwnedRunnerRe != nil && !p.OwnedRunnerRe.MatchString(r.Name) {
 				continue
@@ -392,8 +374,8 @@ func demand(obs observe.Obs) (int, time.Duration) {
 }
 
 // supply 计算 I（所辖 online 空闲 runner 数）、P（冷启在途机器数×rpd）、N。
-// 冷启在途 = droplet 存在、runner 从未 online、未超时、未判死。
-// 机器年龄以 droplet CreatedAt 为准（守护重启不丢，§3.6.1）。
+// 冷启在途 = 机器存在、runner 从未 online、未超时、未判死。
+// 机器年龄以 Machine.CreatedAt 为准（守护重启不丢，§3.6.1）。
 func supply(p Params, st RepoState, views map[string]*machineView, now time.Time) (I, P, N int) {
 	for name, m := range views {
 		N++
@@ -402,7 +384,7 @@ func supply(p Params, st RepoState, views map[string]*machineView, now time.Time
 			continue
 		}
 		I += m.idle
-		if ms.FirstOnlineAt.IsZero() && now.Sub(m.droplet.CreatedAt) <= p.ColdStartTimeout {
+		if ms.FirstOnlineAt.IsZero() && now.Sub(m.mach.CreatedAt) <= p.ColdStartTimeout {
 			P += p.RunnersPerDroplet
 		}
 	}
@@ -443,7 +425,7 @@ func recordActivity(st *RepoState, obs observe.Obs) {
 
 func syncMachines(st *RepoState, obs observe.Obs) {
 	seen := map[string]bool{}
-	for _, d := range obs.Droplets {
+	for _, d := range obs.Machines {
 		seen[d.Name] = true
 		if _, ok := st.Machines[d.Name]; !ok {
 			st.Machines[d.Name] = MachineState{FirstSeen: obs.Now}

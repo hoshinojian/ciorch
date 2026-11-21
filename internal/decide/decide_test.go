@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/machine"
 	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
@@ -17,11 +18,11 @@ func params() Params {
 }
 
 func obs() observe.Obs {
-	return observe.Obs{Now: t0, Complete: true, JobsOK: true, RunnersOK: true, DropletsOK: true}
+	return observe.Obs{Now: t0, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
 }
 
-func droplet(name string, age time.Duration) observe.Droplet {
-	return observe.Droplet{ID: "d-" + name, Name: name, CreatedAt: t0.Add(-age), PriceMonthly: 141}
+func droplet(name string, age time.Duration) machine.Machine {
+	return machine.Machine{ID: "d-" + name, Name: name, CreatedAt: t0.Add(-age)}
 }
 
 func onlineRunner(name string, busy bool) observe.Runner {
@@ -94,7 +95,7 @@ func TestScaleUpWithPending(t *testing.T) {
 	for i := 0; i < 7; i++ {
 		o.Jobs = append(o.Jobs, queuedJob(int64(i), time.Minute))
 	}
-	o.Droplets = []observe.Droplet{droplet("ci-nms-team2-ci-sgp1-01", 1*time.Minute)} // 冷启中
+	o.Machines = []machine.Machine{droplet("ci-nms-team2-ci-sgp1-01", 1*time.Minute)} // 冷启中
 	acts, _ := Decide(params(), RepoState{}, o)
 	if n := countKind(acts, ActCreate); n != 1 {
 		t.Fatalf("Q=7 P=1 应再建 1 台，got %d（%v）", n, acts)
@@ -105,7 +106,7 @@ func TestScaleUpWithPending(t *testing.T) {
 func TestScaleUpSatisfiedByIdle(t *testing.T) {
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, time.Minute)}
-	o.Droplets = []observe.Droplet{droplet("ci-nms-team2-ci-sgp1-01", 10*time.Minute)}
+	o.Machines = []machine.Machine{droplet("ci-nms-team2-ci-sgp1-01", 10*time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner("ci-nms-team2-ci-sgp1-01", false)}
 	acts, _ := Decide(params(), stateWithOnline("ci-nms-team2-ci-sgp1-01"), o)
 	if n := countKind(acts, ActCreate); n != 0 {
@@ -132,7 +133,7 @@ func TestPrototypeBug2Regression(t *testing.T) {
 func TestIdleTeardownThreshold(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 30*time.Minute)}
+	o.Machines = []machine.Machine{droplet(name, 30*time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {
 		FirstOnlineAt: t0.Add(-30 * time.Minute), IdleSince: t0.Add(-19 * time.Minute),
@@ -150,7 +151,7 @@ func TestIdleTeardownThreshold(t *testing.T) {
 func TestIdleTimeoutAdaptive(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	base := RepoState{
 		Machines:     map[string]MachineState{name: {FirstOnlineAt: t0.Add(-time.Hour)}},
@@ -181,7 +182,7 @@ func TestNoTeardownWhenQueuedOrIncomplete(t *testing.T) {
 	// Q>0
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, time.Minute)}
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	if acts, _ := Decide(params(), st, o); countKind(acts, ActDrain) != 0 {
 		t.Fatal("Q>0 绝不缩容")
@@ -189,7 +190,7 @@ func TestNoTeardownWhenQueuedOrIncomplete(t *testing.T) {
 	// 观察不完整
 	o2 := obs()
 	o2.Complete = false
-	o2.Droplets = o.Droplets
+	o2.Machines = o.Machines
 	o2.Runners = o.Runners
 	if acts, _ := Decide(params(), st, o2); countKind(acts, ActDrain) != 0 {
 		t.Fatal("Complete=false 不缩容")
@@ -200,7 +201,7 @@ func TestNoTeardownWhenQueuedOrIncomplete(t *testing.T) {
 func TestTeardownOnePerRound(t *testing.T) {
 	old, young := "ci-nms-team2-ci-sgp1-01", "ci-nms-team2-ci-sgp1-02"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(old, 2*time.Hour), droplet(young, time.Hour)}
+	o.Machines = []machine.Machine{droplet(old, 2*time.Hour), droplet(young, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(old, false), onlineRunner(young, false)}
 	st := RepoState{Machines: map[string]MachineState{
 		old:   {FirstOnlineAt: t0.Add(-2 * time.Hour), IdleSince: t0.Add(-40 * time.Minute)},
@@ -223,7 +224,7 @@ func TestHardLifetime(t *testing.T) {
 	o := obs()
 	o.Complete = false
 	o.JobsOK = false
-	o.Droplets = []observe.Droplet{droplet(name, 8*time.Hour+time.Minute)}
+	o.Machines = []machine.Machine{droplet(name, 8*time.Hour+time.Minute)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-8 * time.Hour), IdleSince: t0.Add(-time.Hour)}}}
 	if acts, _ := Decide(params(), st, o); !hasActionOn(acts, ActDrain, name) {
@@ -231,7 +232,7 @@ func TestHardLifetime(t *testing.T) {
 	}
 	// 8h 但在忙 → 不删，未到 10h 不告警
 	o2 := obs()
-	o2.Droplets = []observe.Droplet{droplet(name, 8*time.Hour+time.Minute)}
+	o2.Machines = []machine.Machine{droplet(name, 8*time.Hour+time.Minute)}
 	o2.Runners = []observe.Runner{onlineRunner(name, true)}
 	st2 := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-8 * time.Hour), BusySince: t0.Add(-30 * time.Minute)}}}
 	acts, _ := Decide(params(), st2, o2)
@@ -243,7 +244,7 @@ func TestHardLifetime(t *testing.T) {
 	}
 	// ≥10h 无论忙闲 → 告警（场景 D 变体）
 	o3 := obs()
-	o3.Droplets = []observe.Droplet{droplet(name, 10*time.Hour+time.Minute)}
+	o3.Machines = []machine.Machine{droplet(name, 10*time.Hour+time.Minute)}
 	o3.Runners = []observe.Runner{onlineRunner(name, true)}
 	st3 := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-10 * time.Hour), BusySince: t0.Add(-3 * time.Hour)}}}
 	if acts, _ := Decide(params(), st3, o3); !hasIncident(acts, "D") {
@@ -257,7 +258,7 @@ func aFixture() (observe.Obs, RepoState) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, 3*time.Minute)} // QAge=3m ≥ 2m
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {
 		FirstOnlineAt: t0.Add(-5 * time.Minute), // 上线超 60s
@@ -342,7 +343,7 @@ func TestStallNoQuotaOnlyRestart(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	p := params()
 	p.MaxRunners = 2
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour), droplet("ci-nms-team2-ci-sgp1-02", time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour), droplet("ci-nms-team2-ci-sgp1-02", time.Hour)}
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	mutate(&st, name, func(m *MachineState) { m.StallSamples = 2 })
 	acts, _ := Decide(p, st, o)
@@ -369,7 +370,7 @@ func bFixture(age time.Duration) (observe.Obs, RepoState) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, age)}
-	o.Droplets = []observe.Droplet{droplet(name, age)}
+	o.Machines = []machine.Machine{droplet(name, age)}
 	return o, RepoState{}
 }
 
@@ -433,7 +434,7 @@ func TestBreakerLifecycle(t *testing.T) {
 	// 试探机 online → closed 且 Fails=0
 	name := "ci-nms-team2-ci-sgp1-05"
 	o5 := obs()
-	o5.Droplets = []observe.Droplet{droplet(name, 3*time.Minute)}
+	o5.Machines = []machine.Machine{droplet(name, 3*time.Minute)}
 	o5.Runners = []observe.Runner{onlineRunner(name, false)}
 	st6 := RepoState{
 		Breaker:  Breaker{State: "half-open", Fails: 3, OpenedAt: t0.Add(-31 * time.Minute), Cooldown: 30 * time.Minute},
@@ -472,7 +473,7 @@ func TestOfflineTwoSamples(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
 	o.Jobs = []observe.Job{queuedJob(1, time.Minute)}
-	o.Droplets = []observe.Droplet{droplet(name, time.Hour)}
+	o.Machines = []machine.Machine{droplet(name, time.Hour)}
 	o.Runners = []observe.Runner{{ID: 1, Name: name, Status: "offline", Busy: false}}
 	st := RepoState{Machines: map[string]MachineState{name: {FirstOnlineAt: t0.Add(-time.Hour)}}}
 	// 第 1 轮：计数
@@ -497,7 +498,7 @@ func TestOfflineTwoSamples(t *testing.T) {
 func TestNeverOnlineIsBNotC(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	o := obs()
-	o.Droplets = []observe.Droplet{droplet(name, 9*time.Minute)} // 超冷启窗
+	o.Machines = []machine.Machine{droplet(name, 9*time.Minute)} // 超冷启窗
 	o.Runners = []observe.Runner{{ID: 1, Name: name, Status: "offline"}}
 	acts, st2 := Decide(params(), RepoState{}, o)
 	if !hasActionOn(acts, ActForceDelete, name) || st2.Breaker.Fails != 1 {
@@ -516,7 +517,7 @@ func TestJobStuckThresholds(t *testing.T) {
 	name := "ci-nms-team2-ci-sgp1-01"
 	mk := func(jobAge time.Duration) (observe.Obs, RepoState) {
 		o := obs()
-		o.Droplets = []observe.Droplet{droplet(name, 2*time.Hour)}
+		o.Machines = []machine.Machine{droplet(name, 2*time.Hour)}
 		o.Runners = []observe.Runner{onlineRunner(name, true)}
 		o.Jobs = []observe.Job{{
 			ID: 5, RunID: 1, Status: "in_progress", RunnerName: name,
@@ -602,24 +603,6 @@ func TestObserveFailStreak(t *testing.T) {
 	_, st3 := Decide(params(), st2, o2)
 	if st3.ObserveFailStreak != 0 {
 		t.Fatal("观察恢复应清零 streak")
-	}
-}
-
-// ---------- 命名（§8.1）----------
-
-// NextName 跳号、多仓不同前缀互不干扰。
-func TestNextNameSkips(t *testing.T) {
-	existing := []observe.Droplet{
-		{Name: "ci-nms-team2-ci-sgp1-01"},
-		{Name: "ci-nms-team2-ci-sgp1-03"}, // 02 已删，跳号不复用
-		{Name: "ci-nms-team2-ci-sgp2-07"}, // 同前缀不同区域
-		{Name: "ci-web-team2-ci-sgp1-05"}, // 不同仓前缀
-	}
-	if got := NextName("ci-nms", "team2-ci", "sgp1", existing); got != "ci-nms-team2-ci-sgp1-04" {
-		t.Fatalf("应跳号取 04，got %s", got)
-	}
-	if got := NextName("ci-nms", "team2-ci", "sgp1", nil); got != "ci-nms-team2-ci-sgp1-01" {
-		t.Fatalf("空场应取 01，got %s", got)
 	}
 }
 
