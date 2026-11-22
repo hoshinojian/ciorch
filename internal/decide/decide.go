@@ -227,6 +227,19 @@ func (m *machineView) anyBusy() bool {
 	return false
 }
 
+// hasAssignedJob：jobs 接口里有分给本机 runner 的 in_progress job。runners 接口的
+// busy 可能滞后（线上实测跑 job 近 3 分钟仍读到 busy=false），判"不接活"前须以此佐证。
+func (m *machineView) hasAssignedJob(obs observe.Obs) bool {
+	for _, r := range m.runners {
+		for _, j := range obs.Jobs {
+			if j.Status == "in_progress" && j.RunnerName == r.Name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m *machineView) allIdleOnline() bool {
 	return m.online > 0 && m.idle == len(m.runners)
 }

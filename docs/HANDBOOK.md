@@ -437,7 +437,7 @@ runner online → GitHub 直接把 job 派给它 → 跑完 → 空闲满阈值 
 | **Bad 机 / Drain 残留** | 已标 Bad 的机器 | 每轮重发 ForceDelete（Remedy=draining 则重发 Drain），幂等。Remedy=draining 且注册已消失：判 Bad 并重试删机，不记为掉线（R7，PR #11） | — |
 | **C 掉线** | 曾 online，本轮无 online runner，`OfflineSamples ≥ 2` | `Q>0 且 N<max_runners` 时先 Create 替换机；标 Bad、Remedy=replacing；ForceDelete（先删机后删注册） | 同仓 24h 内第 2 次（`OfflineEvents`），key=机器名 |
 | **B 冷启失败** | 从未 online，机器年龄 ≥ `cold_start_timeout`(8m) | 替换条件同 C；ForceDelete；`Breaker.Fails++`；`Fails ≥ 3` 或处于 half-open 时转 open | **只在转入 open 的瞬间**开一次，key=`breaker`（仓级单发，PR #48） |
-| **A 假活（P139）** | `Q>0 且 QAge ≥ 2m`，本机 online 且不忙，上线 ≥60s，连续 3 轮 | 替换条件同 C；对每个 online runner 发 SSHAct `restart-runner`，Remedy=restarting；`stall_restart_grace`(2m) 内转 busy 则解除，仍不接活标 Bad、Drain | 同仓 24h 内第 2 次（`StallEvents`）。【代码与文档不一致】文档说「重启失败且无配额」也升级，代码在 SSHAct 失败时只记日志 |
+| **A 假活（P139）** | `Q>0 且 QAge ≥ 2m`，本机 online 且不忙（busy=false **且** jobs 接口无分给本机 runner 的 in_progress job），**本机持续空闲（`IdleSince`）≥ 2m**，上线 ≥60s，连续 3 轮（后两条为 PR #56 新增，见 §9.1 #28） | 替换条件同 C；对每个 online runner 发 SSHAct `restart-runner`，Remedy=restarting；`stall_restart_grace`(2m) 内转 busy 或 jobs 显示已接活则解除，仍不接活标 Bad、Drain | 同仓 24h 内第 2 次（`StallEvents`）。【代码与文档不一致】文档说「重启失败且无配额」也升级，代码在 SSHAct 失败时只记日志 |
 | **D job 卡死** | 按 **job 粒度**：本机 online 且 busy 的 runner 名与某 in_progress job 的 `RunnerName` 相同，取 `now-StartedAt` 最大值；找不到 job 佐证就不判（防止连续接单的机器被误杀，PR #8） | ≥90m：标 Bad、ForceDelete | ≥60m 起每轮发 incident（由 incident 模块去重） |
 | **D 变体：硬寿命超限** | 年龄 ≥ `max_lifetime+2h` 且仍忙 | 无 | 发 D 事故，key=机器名 |
 | **G 外部 runner 假活** | `Q>0 且 QAge≥2m` 时，名字不在命名空间内、online 且空闲的 runner | **不操作** | 立即，key=runner 名；开 issue；配了 LLM 时直接转 waiting-human 并 @维护者、不调 LLM；未配 LLM 时停在 diagnosing，靠安静恢复收尾（diagnose.go:53-63） |
@@ -1050,6 +1050,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 25 | health 磁盘/进程判断错 | df 取了 Capacity 列而非 Available；pgrep 空输出被误判为在运行；dash 下 `return` 在函数外 | 修解析 + `internal/sys` 用真实输出样本测试；`return`→`break` | cirunner #6 |
 | 26 | `pgrep -f Runner.Listener` STOP 后 ssh 断开 | 匹配到会话 bash 自己的命令行，STOP 也打到 bash | 人工 ssh 命令里用 `[R]unner.Listener` 写法（机器侧 Go 代码直接 exec `pgrep -f`，不受影响） | ciorch #24、#26；REDESIGN §5.4（其「机器侧用 pgrep -x」说法与代码不符） |
 | 27 | 原型 stats 与 shadow 对比口径被污染 | 额度共用、整点重置 | 用 `/rate_limit` 前后 `core.used` 差测 | ciorch #14 |
+| 28 | **切换后场景 A 误杀在跑的 job**（11-22 17:00，nms main run 45046644413：build/test 跑到 3 分钟被 `restart-runner` 打断；16:44 同类误判因 ssh 255 未得手） | ① ciorch 读到两台在跑 job 的 runner 连续 3 轮 busy=false（同时 jobs 接口 I=2 且 runner_name 对得上；事后无缓存逐 5s 复测未复现，来源未定：GitHub busy 滞后或 ETag 304 旧缓存）；② 判据用**队列**年龄 QAge，满载排队 12m 后机器刚跑完 job 的交接间隙（实测 77s 才接下一个）也被当假活 | busy=false 须有 jobs 佐证（本机 runner 无 in_progress job）；另要求本机 `IdleSince` 持续 ≥ `stall_queue_age`；回归测试 + 变异测试 | ciorch #56 |
 
 ### 9.2 部署运维
 
