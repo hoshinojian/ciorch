@@ -239,15 +239,11 @@ func (e incidentEvidence) RerunnableRuns(ctx context.Context, repo string) map[i
 	return out
 }
 
-// wiring 组装真实客户端与执行面：按配置的 pools 从 Registry 构造各池
-// Provider（vpsctl 实现经 init 注册），profile→池解析 = profile.pools[0]
-// （长度 1 由 config 校验强制）。readOnly（plan/status/daemon -dry-run）
-// 时事故模块同为 DryRun：engine 的 dry-run 分支仍会 fireIncident，不置位
-// 就会真开 issue、真调 LLM、真执行 LLM 动作。
-func wiring(cfg *config.Config, token string, readOnly bool) (*runtime, error) {
-	rt := &runtime{}
+// ghClient 按配置构造 GitHub 客户端：配了 App 走 App 认证（§3.4.2 生产路径：
+// 私钥 PEM 加载，按仓铸 installation token），否则走 token 解析链（开发备选）。
+// stats 也走这里——编排器机器上没有 gh，不能依赖 gh auth token 兜底。
+func ghClient(cfg *config.Config, token string) (*githubapp.Client, error) {
 	if cfg.GitHubApp.AppID != 0 && cfg.GitHubApp.PrivateKeyFile != "" {
-		// GitHub App 生产路径（§3.4.2）：私钥 PEM 加载，按仓铸 installation token
 		pem, err := os.ReadFile(cfg.GitHubApp.PrivateKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("读 App 私钥: %w", err)
@@ -256,16 +252,29 @@ func wiring(cfg *config.Config, token string, readOnly bool) (*runtime, error) {
 		if err != nil {
 			return nil, fmt.Errorf("解析 App 私钥（应为 PKCS#1/PKCS#8 PEM）: %w", err)
 		}
-		rt.gh = githubapp.NewAppClient(githubapp.NewAppAuth(cfg.GitHubApp.AppID, key))
-	} else {
-		tok, err := config.ResolveToken(cfg, token, func() (string, error) {
-			return githubapp.GHToken(context.Background(), "gh", nil)
-		})
-		if err != nil {
-			return nil, err
-		}
-		rt.gh = githubapp.NewClient(tok)
+		return githubapp.NewAppClient(githubapp.NewAppAuth(cfg.GitHubApp.AppID, key)), nil
 	}
+	tok, err := config.ResolveToken(cfg, token, func() (string, error) {
+		return githubapp.GHToken(context.Background(), "gh", nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return githubapp.NewClient(tok), nil
+}
+
+// wiring 组装真实客户端与执行面：按配置的 pools 从 Registry 构造各池
+// Provider（vpsctl 实现经 init 注册），profile→池解析 = profile.pools[0]
+// （长度 1 由 config 校验强制）。readOnly（plan/status/daemon -dry-run）
+// 时事故模块同为 DryRun：engine 的 dry-run 分支仍会 fireIncident，不置位
+// 就会真开 issue、真调 LLM、真执行 LLM 动作。
+func wiring(cfg *config.Config, token string, readOnly bool) (*runtime, error) {
+	rt := &runtime{}
+	gh, err := ghClient(cfg, token)
+	if err != nil {
+		return nil, err
+	}
+	rt.gh = gh
 	rt.providers = map[string]machine.Provider{}
 	rt.poolCaps = map[string]int{}
 	rt.hints = map[string]float64{}
@@ -577,9 +586,7 @@ func cmdStats(configPath, token, repoFilter, sinceStr string) error {
 	if err != nil {
 		return err
 	}
-	tok, err := config.ResolveToken(cfg, token, func() (string, error) {
-		return githubapp.GHToken(context.Background(), "gh", nil)
-	})
+	client, err := ghClient(cfg, token)
 	if err != nil {
 		return err
 	}
@@ -587,7 +594,6 @@ func cmdStats(configPath, token, repoFilter, sinceStr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	client := githubapp.NewClient(tok)
 	now := time.Now()
 	for _, re := range cfg.Repos {
 		if repoFilter != "" && re.Repo != repoFilter {
