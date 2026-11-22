@@ -419,7 +419,7 @@ type Breaker struct {
 
 | 场景 | 判据（参数见 §3.6.6） | 固定逻辑处置 | 何时升级为事故（§3.10） |
 |---|---|---|---|
-| **A 假活**（P139：online 不接活） | `Q>0` 且 `QAge ≥ stall_queue_age`(2m)，该 runner online、busy=false、`Now-FirstOnlineAt ≥ stall_min_online`(60s)，连续 `stall_samples`(3) 轮成立 | ① 有配额 → 立即 `Create` 替换机（先建后拆）；② 同时 `SSHAct(restart-runner)`，`Remedy=restarting`；③ 重启后 `stall_restart_grace`(2m) 内该 runner 接到活（busy=true）→ 解除；仍不接 → 标 `Bad` → `Drain`（注销+删机） | 同一仓 24h 内第 2 次发生；或重启失败且无配额建替换机 |
+| **A 假活**（P139：online 不接活） | `Q>0` 且 `QAge ≥ stall_queue_age`(2m)，该 runner online、busy=false 且 jobs 接口无分给它的 in_progress job、本机 `Now-IdleSince ≥ stall_queue_age`、`Now-FirstOnlineAt ≥ stall_min_online`(60s)（前两条为 PR #56 补，防误杀在跑 job 与交接间隙），连续 `stall_samples`(3) 轮成立 | ① 有配额 → 立即 `Create` 替换机（先建后拆）；② 同时 `SSHAct(restart-runner)`，`Remedy=restarting`；③ 重启后 `stall_restart_grace`(2m) 内该 runner 接到活（busy=true）→ 解除；仍不接 → 标 `Bad` → `Drain`（注销+删机） | 同一仓 24h 内第 2 次发生；或重启失败且无配额建替换机 |
 | **B 冷启失败** | droplet 年龄 ≥ `cold_start_timeout`(8m) 且 runner 从未 online | ① 有配额 → `Create` 替换；② 删旧机（不必注销，从未注册成功；若有同名 offline 注册一并删）；③ `Breaker.Fails++` | 熔断打开时（见下） |
 | **C 掉线** | 曾 online，当前 offline（或注册消失）连续 `offline_samples`(2) 轮 | 同 B（先建后拆），不计熔断 | 同一台机器以外，同仓 24h 内第 2 次 |
 | **D job 卡死** | runner busy 持续 ≥ `job_stuck_alert`(60m) | 只升级事故；≥ `job_stuck_kill`(90m) → `Drain`（强删：先删 droplet 再删注册——job 已判死） | ≥60m 即开事故 |

@@ -185,14 +185,18 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 }
 
 // scenarioA 假活（P139）：Q>0 且 QAge ≥ StallQueueAge，该机 online、busy=false、
-// 上线 ≥ StallMinOnline，连续 StallSamples 轮 → 有配额先建替换机 + SSH 重启；
+// 无 in_progress job 佐证、本机持续空闲 ≥ StallQueueAge、上线 ≥ StallMinOnline，
+// 连续 StallSamples 轮 → 有配额先建替换机 + SSH 重启；
 // 重启后 StallRestartGrace 内接到活 → 解除；仍不接 → Bad → Drain。
+// 本机空闲时长单独计：满载排队时 QAge 早已超阈值，刚跑完 job 的交接间隙（实测约 1m）
+// 不能当假活；busy 读数可能滞后，以 jobs 接口的 runner 归属兜底。
 func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machineView, Q int, QAge time.Duration, emit func(Action), remedied map[string]bool) {
 	for name, m := range views {
 		ms := st.Machines[name]
+		working := m.anyBusy() || m.hasAssignedJob(obs)
 		// 重启补救在途：观察窗口内解除或判死
 		if ms.Remedy == "restarting" {
-			if m.anyBusy() {
+			if working {
 				ms.Remedy, ms.RemedyAt = "", time.Time{}
 				ms.StallSamples = 0
 				st.Machines[name] = ms
@@ -213,7 +217,8 @@ func scenarioA(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		if remedied[name] || ms.Bad {
 			continue
 		}
-		stalled := Q > 0 && QAge >= p.StallQueueAge && m.online > 0 && !m.anyBusy() &&
+		stalled := Q > 0 && QAge >= p.StallQueueAge && m.online > 0 && !working &&
+			!ms.IdleSince.IsZero() && obs.Now.Sub(ms.IdleSince) >= p.StallQueueAge &&
 			!ms.FirstOnlineAt.IsZero() && obs.Now.Sub(ms.FirstOnlineAt) >= p.StallMinOnline
 		if !stalled {
 			ms.StallSamples = 0

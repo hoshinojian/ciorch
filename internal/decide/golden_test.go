@@ -103,7 +103,7 @@ func goldenScenarios() []goldenScenario {
 		},
 		{
 			name: "stall-a",
-			init: RepoState{Machines: map[string]MachineState{n01: {FirstOnlineAt: at(-5 * time.Minute)}}},
+			init: RepoState{Machines: map[string]MachineState{n01: {FirstOnlineAt: at(-5 * time.Minute), IdleSince: at(-3 * time.Minute)}}},
 			obs: []observe.Obs{
 				stallObs(t0),                    // 样本 1
 				stallObs(t0),                    // 样本 2
@@ -116,22 +116,22 @@ func goldenScenarios() []goldenScenario {
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
-				func() observe.Obs { // +90s：样本 1
-					o := stallObs(at(90 * time.Second))
+				func() observe.Obs { // +150s（上线 ≥60s 且本机空闲 ≥2m）：样本 1
+					o := stallObs(at(150 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
 					o.Machines = []machine.Machine{droplet(n02, 20*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // 样本 2
-					o := stallObs(at(90 * time.Second))
+					o := stallObs(at(150 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
 					o.Machines = []machine.Machine{droplet(n02, 20*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}
 					return o
 				}(),
 				func() observe.Obs { // 样本 3 → 命中：24h 内第 2 次 → 事故 A
-					o := stallObs(at(90 * time.Second))
+					o := stallObs(at(150 * time.Second))
 					o.Jobs = []observe.Job{queuedJob(2, 4*time.Minute)}
 					o.Machines = []machine.Machine{droplet(n02, 21*time.Minute)}
 					o.Runners = []observe.Runner{onlineRunner(n02, false)}

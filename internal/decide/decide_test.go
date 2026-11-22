@@ -262,8 +262,56 @@ func aFixture() (observe.Obs, RepoState) {
 	o.Runners = []observe.Runner{onlineRunner(name, false)}
 	st := RepoState{Machines: map[string]MachineState{name: {
 		FirstOnlineAt: t0.Add(-5 * time.Minute), // 上线超 60s
+		IdleSince:     t0.Add(-3 * time.Minute), // 本机持续空闲 ≥ 2m
 	}}}
 	return o, st
+}
+
+// 线上误判 1（2026-11-22 17:00，nms run 45046644413）：runners 接口读到 busy=false，
+// 但 jobs 接口显示本机 runner 正在跑 in_progress job → 不判假活（job 佐证优先）。
+func TestStallNotWhenJobAssigned(t *testing.T) {
+	o, st := aFixture()
+	name := "ci-nms-team2-ci-sgp1-01"
+	mutate(&st, name, func(m *MachineState) { m.StallSamples = 2 })
+	o.Jobs = append(o.Jobs, observe.Job{ID: 9, RunID: 100, Status: "in_progress",
+		CreatedAt: t0.Add(-3 * time.Minute), StartedAt: t0.Add(-3 * time.Minute), RunnerName: name})
+	acts, st2 := Decide(params(), st, o)
+	if countKind(acts, ActSSHAct) != 0 || hasIncident(acts, "A") {
+		t.Fatalf("本机有 in_progress job 不应判假活：%v", acts)
+	}
+	if st2.Machines[name].StallSamples != 0 {
+		t.Fatalf("有 job 佐证应清零采样：%+v", st2.Machines[name])
+	}
+}
+
+// 线上误判 2（2026-11-22 16:44，nms run 45044354990）：满载排队 12m 后本机刚跑完
+// 上一个 job、空闲才 55s（交接间隙，77s 后自己接到下一个）→ QAge 再老也不判假活。
+func TestStallNeedsMachineIdleDuration(t *testing.T) {
+	o, st := aFixture()
+	name := "ci-nms-team2-ci-sgp1-01"
+	o.Jobs = []observe.Job{queuedJob(1, 12*time.Minute)}
+	mutate(&st, name, func(m *MachineState) {
+		m.StallSamples = 2
+		m.IdleSince = t0.Add(-55 * time.Second)
+	})
+	if acts, _ := Decide(params(), st, o); countKind(acts, ActSSHAct) != 0 {
+		t.Fatalf("本机空闲不足 2m 不应判假活：%v", acts)
+	}
+}
+
+// 重启观察窗内：busy 仍读到 false 但 jobs 显示已接活 → 同样解除补救，不判死。
+func TestStallRestartGraceRecoveryByJob(t *testing.T) {
+	o, st := aFixture()
+	name := "ci-nms-team2-ci-sgp1-01"
+	st.Machines[name] = MachineState{
+		FirstOnlineAt: t0.Add(-10 * time.Minute), Remedy: "restarting", RemedyAt: t0.Add(-3 * time.Minute),
+	}
+	o.Jobs = append(o.Jobs, observe.Job{ID: 9, RunID: 100, Status: "in_progress",
+		CreatedAt: t0.Add(-time.Minute), StartedAt: t0.Add(-time.Minute), RunnerName: name})
+	acts, st2 := Decide(params(), st, o)
+	if st2.Machines[name].Bad || hasActionOn(acts, ActDrain, name) || st2.Machines[name].Remedy != "" {
+		t.Fatalf("jobs 显示已接活应解除补救而非判死：%v %+v", acts, st2.Machines[name])
+	}
 }
 
 // 只差一轮不触发（此前 1 次 + 本轮 = 2 次 < 3）。
