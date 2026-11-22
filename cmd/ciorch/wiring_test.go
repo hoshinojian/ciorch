@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -174,5 +178,28 @@ func TestDiagOutputKeepsUnhealthyJSON(t *testing.T) {
 	}
 	if out, err := diagOutput(body, nil); err != nil || string(out) != string(body) {
 		t.Fatalf("exit 0 原样返回：%q %v", out, err)
+	}
+}
+
+// stats 与 daemon 同走 ghClient：配了 App 就不依赖 gh 子进程（编排器机器
+// 没装 gh，此前 stats 回退 gh auth token 直接失败）。
+func TestGHClientPrefersAppWithoutGH(t *testing.T) {
+	t.Setenv("PATH", "")
+	t.Setenv("CIORCH_TOKEN", "")
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemFile := filepath.Join(t.TempDir(), "app.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(pemFile, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{GitHubApp: config.GitHubAppCfg{AppID: 1, PrivateKeyFile: pemFile}}
+	if _, err := ghClient(cfg, ""); err != nil {
+		t.Fatalf("配了 App 应直接走 App 认证，不碰 gh：%v", err)
+	}
+	if _, err := ghClient(&config.Config{}, ""); err == nil {
+		t.Fatal("未配 App、无 token、无 gh 时应报错")
 	}
 }
