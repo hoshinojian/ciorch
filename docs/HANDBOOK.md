@@ -1050,7 +1050,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 25 | health 磁盘/进程判断错 | df 取了 Capacity 列而非 Available；pgrep 空输出被误判为在运行；dash 下 `return` 在函数外 | 修解析 + `internal/sys` 用真实输出样本测试；`return`→`break` | cirunner #6 |
 | 26 | `pgrep -f Runner.Listener` STOP 后 ssh 断开 | 匹配到会话 bash 自己的命令行，STOP 也打到 bash | 人工 ssh 命令里用 `[R]unner.Listener` 写法（机器侧 Go 代码直接 exec `pgrep -f`，不受影响） | ciorch #24、#26；REDESIGN §5.4（其「机器侧用 pgrep -x」说法与代码不符） |
 | 27 | 原型 stats 与 shadow 对比口径被污染 | 额度共用、整点重置 | 用 `/rate_limit` 前后 `core.used` 差测 | ciorch #14 |
-| 28 | **切换后场景 A 误杀在跑的 job**（11-22 17:00，nms main run 45046644413：build/test 跑到 3 分钟被 `restart-runner` 打断；16:44 同类误判因 ssh 255 未得手） | ① ciorch 读到两台在跑 job 的 runner 连续 3 轮 busy=false（同时 jobs 接口 I=2 且 runner_name 对得上；事后无缓存逐 5s 复测未复现，来源未定：GitHub busy 滞后或 ETag 304 旧缓存）；② 判据用**队列**年龄 QAge，满载排队 12m 后机器刚跑完 job 的交接间隙（实测 77s 才接下一个）也被当假活 | busy=false 须有 jobs 佐证（本机 runner 无 in_progress job）；另要求本机 `IdleSince` 持续 ≥ `stall_queue_age`；回归测试 + 变异测试 | ciorch #56 |
+| 28 | **切换后场景 A 误杀在跑的 job**（11-22 17:00，nms main run 45046644413：build/test 跑到 3 分钟被 `restart-runner` 打断；16:44 同类误判因 ssh 255 未得手） | ① 两台 job 开跑后约 3 分钟内，ciorch 每轮都把两台 runner 读作 busy=false（日志 `I=2`，I 是 online 且空闲的 runner 数）；同期 Q 由 7 降到 5，说明 jobs 一路已看到两个 job 离开排队。17:14 对同一 run 的 rerun 同条件下 ciorch 读数正确（`I=0`），我方无缓存逐 5s 复测亦正确，未复现；来源未定（GitHub busy 滞后或 ETag 304 复用空闲期缓存）；② 判据用**队列**年龄 QAge，满载排队 12m 后机器刚跑完 job 的交接间隙（实测 77s 才接下一个）也被当假活 | busy=false 须有 jobs 佐证（本机 runner 无 in_progress job）；另要求本机 `IdleSince` 持续 ≥ `stall_queue_age`；回归测试 + 变异测试 | ciorch #56 |
 
 ### 9.2 部署运维
 
