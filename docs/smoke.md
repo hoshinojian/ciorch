@@ -30,8 +30,11 @@ gh run list --repo hoshinojian/ciorch-sandbox --workflow smoke --limit 1
 - ~3 分钟内（冷启实测 ~2.5m）首个 job 开跑（GitHub 侧 job 转 in_progress）。
 - 全部 job 跑完（最长 600s 的 long-sleep）后进入空闲回收窗口（此后无新
   dispatch），编排器日志出现空闲回收 `drain` 动作，逐台删除；注册清干净。
-  空闲阈值是自适应的（§3.6.3）：近 2h 活跃点 ≥2 → `idle_timeout_busy`(45m)，
-  否则 20m——一轮刚干完活的机器实测走 45m（2026-11-21 冒烟）。
+  空闲阈值是自适应的（§3.6.3）：近 2h **不同 run** 的活跃点 ≥2 →
+  `idle_timeout_busy`(45m)，否则 20m。注意：单跑一轮冒烟（1 个 run）按设计
+  应走 **20m** 档；2026-11-21 首测出现的 45m 是 LastActivity 跨轮不去重 bug
+  所致（同 run 8 job 记 8 点顶满判据），修复见 PR #47——修复后单 run 只记
+  1 点、正常回落 20m 档。
 
 **取证**：
 - 建机时刻：`journalctl -u ciorch | grep 已建机`（与 dispatch 时间差）。
