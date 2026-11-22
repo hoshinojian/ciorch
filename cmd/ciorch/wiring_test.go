@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -152,5 +153,26 @@ func TestWiringReadOnlyMarksIncidentsDryRun(t *testing.T) {
 		if rt.incidents.DryRun != readOnly {
 			t.Fatalf("readOnly=%v：incidents.DryRun 应为 %v", readOnly, readOnly)
 		}
+	}
+}
+
+// cirunner diag 在机器不健康时 exit 1 但 stdout 仍是完整 JSON（正是事故最需要
+// 的证据）：保留输出；ssh 连不上（255）或输出非 JSON 才算失败。
+func TestDiagOutputKeepsUnhealthyJSON(t *testing.T) {
+	exit := func(code int) error {
+		return exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	}
+	body := []byte(`{"health":{"ok":false}}`)
+	if out, err := diagOutput(body, exit(1)); err != nil || string(out) != string(body) {
+		t.Fatalf("exit 1 + JSON 应保留输出：%q %v", out, err)
+	}
+	if _, err := diagOutput(nil, exit(255)); err == nil {
+		t.Fatal("ssh 连不上（255）应报错")
+	}
+	if _, err := diagOutput([]byte("not json"), exit(1)); err == nil {
+		t.Fatal("exit 1 但非 JSON 应报错")
+	}
+	if out, err := diagOutput(body, nil); err != nil || string(out) != string(body) {
+		t.Fatalf("exit 0 原样返回：%q %v", out, err)
 	}
 }
