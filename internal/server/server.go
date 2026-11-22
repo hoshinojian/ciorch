@@ -142,6 +142,7 @@ func (d *Deps) handleWorkflowJob(w http.ResponseWriter, body []byte) {
 	}
 	if d.Cache != nil {
 		d.Cache.Put(observe.JobCacheEntry{
+			Repo: repo,
 			Job: observe.Job{
 				ID: ev.WorkflowJob.ID, RunID: ev.WorkflowJob.RunID,
 				Status: ev.WorkflowJob.Status, Labels: ev.WorkflowJob.Labels,

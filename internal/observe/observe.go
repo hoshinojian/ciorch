@@ -7,6 +7,7 @@ package observe
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hoshinojian/ciorch/internal/config"
@@ -71,7 +72,9 @@ type PoolOf func(r config.RepoEntry, p config.Profile) Pool
 
 // JobCacheEntry 是 webhook 送来的 job 快照（§3.4.5：只用于补齐 run 列表
 // 尚未反映的刚出现 job；条目 2 小时过期，同 job id 以 updated 更新者为准）。
+// Repo 是来源仓：缓存全局一份、各仓轮询共用，取用时必须按仓过滤。
 type JobCacheEntry struct {
+	Repo      string
 	Job       Job
 	UpdatedAt time.Time
 }
@@ -84,8 +87,10 @@ type Collector struct {
 	Now    func() time.Time
 }
 
-// JobCache 是按 job id 的 webhook 快照缓存。
+// JobCache 是按 job id 的 webhook 快照缓存。webhook handler（每请求一个
+// goroutine）写、daemon 轮询读，由 mu 保护。
 type JobCache struct {
+	mu      sync.Mutex
 	entries map[int64]JobCacheEntry
 }
 
@@ -93,13 +98,19 @@ type JobCache struct {
 func NewJobCache() *JobCache { return &JobCache{entries: map[int64]JobCacheEntry{}} }
 
 // Put 写入/更新一条快照。
-func (c *JobCache) Put(e JobCacheEntry) { c.entries[e.Job.ID] = e }
+func (c *JobCache) Put(e JobCacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[e.Job.ID] = e
+}
 
-// Snapshot 返回未过期条目（2 小时，§3.4.5）。
-func (c *JobCache) Snapshot(now time.Time) []JobCacheEntry {
+// Snapshot 返回 repo 的未过期条目（2 小时，§3.4.5）。
+func (c *JobCache) Snapshot(now time.Time, repo string) []JobCacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	var out []JobCacheEntry
 	for _, e := range c.entries {
-		if now.Sub(e.UpdatedAt) <= 2*time.Hour {
+		if e.Repo == repo && now.Sub(e.UpdatedAt) <= 2*time.Hour {
 			out = append(out, e)
 		}
 	}
@@ -170,7 +181,7 @@ func (c *Collector) Collect(ctx context.Context, r config.RepoEntry, p config.Pr
 		}
 		// webhook 缓存合并：同 job id 以 updated 更新者为准（§3.5 步骤 2）。
 		if c.Cache != nil {
-			for _, e := range c.Cache.Snapshot(now) {
+			for _, e := range c.Cache.Snapshot(now, repo) {
 				if old, ok := byID[e.Job.ID]; !ok || e.UpdatedAt.After(jobUpdated(old)) {
 					byID[e.Job.ID] = e.Job
 				}
