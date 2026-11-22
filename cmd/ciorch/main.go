@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -522,7 +523,18 @@ type sshx struct{ keyFile string }
 
 // Diag 经 ssh 调机器上 cirunner diag --json（事故证据采集，§3.10.3）。
 func (s sshx) Diag(ctx context.Context, ip string) ([]byte, error) {
-	return s.run(ctx, ip, "/usr/local/bin/cirunner", "diag", "--json")
+	out, err := s.output(ctx, ip, "/usr/local/bin/cirunner", "diag", "--json")
+	return diagOutput(out, err)
+}
+
+// diagOutput：diag 在机器不健康时 exit 1，但 stdout 仍是完整 JSON——这正是
+// 事故最需要的证据，保留；ssh 自身失败（255）或输出非 JSON 才算采集失败。
+func diagOutput(out []byte, err error) ([]byte, error) {
+	var ee *exec.ExitError
+	if err != nil && errors.As(err, &ee) && ee.ExitCode() == 1 && json.Valid(out) {
+		return out, nil
+	}
+	return out, err
 }
 
 func (s sshx) Act(ctx context.Context, ip, action string) ([]byte, error) {
@@ -530,6 +542,15 @@ func (s sshx) Act(ctx context.Context, ip, action string) ([]byte, error) {
 }
 
 func (s sshx) run(ctx context.Context, ip string, cmd ...string) ([]byte, error) {
+	out, err := s.output(ctx, ip, cmd...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// output 执行远端命令，返回 stdout 与（包装后仍可 errors.As 出 ExitError 的）错误。
+func (s sshx) output(ctx context.Context, ip string, cmd ...string) ([]byte, error) {
 	args := []string{
 		"-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
 		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
@@ -542,7 +563,7 @@ func (s sshx) run(ctx context.Context, ip string, cmd ...string) ([]byte, error)
 	c := exec.CommandContext(ctx, "ssh", args...)
 	out, err := c.Output()
 	if err != nil {
-		return nil, fmt.Errorf("ssh %s %s: %w", ip, cmd, err)
+		return out, fmt.Errorf("ssh %s %s: %w", ip, cmd, err)
 	}
 	return out, nil
 }
