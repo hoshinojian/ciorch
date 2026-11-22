@@ -98,7 +98,7 @@ func (v Verdict) Validate(incidentType string, vc ValidateContext) (Verdict, str
 	switch v.Action {
 	case "restart_runner", "replace_droplet", "drain_droplet":
 		if !containsStr(vc.OwnedMachines, v.ActionArgs.Machine) {
-			return downgrade(fmt.Sprintf("machine %q 不是本仓所辖的现存机器（在册：%v）", v.ActionArgs.Machine, vc.OwnedMachines))
+			return downgrade(fmt.Sprintf("machine %q 不是本仓可下手的机器（须在当前观察里、未标 Bad、不在删除流程中；可下手：%v）", v.ActionArgs.Machine, vc.OwnedMachines))
 		}
 	case "switch_pool":
 		if !containsStr(vc.ProfilePools, v.ActionArgs.Pool) {

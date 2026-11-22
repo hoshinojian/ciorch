@@ -403,6 +403,40 @@ func TestColdStartFailReplacesAndCounts(t *testing.T) {
 	}
 }
 
+// 熔断打开的事故按仓级主体（breaker）只开一个：同轮两台冷启失败、Fails
+// 达上限 → 只 1 个 B 事故（2026-11-21 冒烟 S4 实测按机器开了 #4/#5 两个）。
+func TestBreakerOpenSingleRepoLevelIncident(t *testing.T) {
+	n1, n2 := "ci-nms-team2-ci-sgp1-01", "ci-nms-team2-ci-sgp1-02"
+	o := obs()
+	o.Jobs = []observe.Job{queuedJob(1, 9*time.Minute)}
+	o.Machines = []machine.Machine{droplet(n1, 9*time.Minute), droplet(n2, 9*time.Minute)}
+	st := RepoState{Breaker: Breaker{Fails: 2}} // 本轮第 3、4 次
+	acts, st2 := Decide(params(), st, o)
+	if st2.Breaker.Fails != 4 || st2.Breaker.State != "open" {
+		t.Fatalf("Fails 应 4 且 open：%+v", st2.Breaker)
+	}
+	var incs []Action
+	for _, a := range acts {
+		if a.Kind == ActIncident && a.IncidentType == "B" {
+			incs = append(incs, a)
+		}
+	}
+	if len(incs) != 1 || incs[0].IncidentKey != "breaker" {
+		t.Fatalf("同轮双机熔断只应开 1 个仓级事故（key=breaker），got %d 个：%v", len(incs), incs)
+	}
+	// 已 open 期间又一台超龄（如建机竞速的迟失败者）→ 不再开新事故
+	o2 := obs()
+	o2.Jobs = []observe.Job{queuedJob(1, 9*time.Minute)}
+	o2.Machines = []machine.Machine{droplet("ci-nms-team2-ci-sgp1-03", 9*time.Minute)}
+	st3 := RepoState{Breaker: Breaker{State: "open", Fails: 4, OpenedAt: t0.Add(-time.Minute), Cooldown: 30 * time.Minute}}
+	acts3, _ := Decide(params(), st3, o2)
+	for _, a := range acts3 {
+		if a.Kind == ActIncident && a.IncidentType == "B" {
+			t.Fatalf("open 期间的后续 B 不应再开事故：%v", a)
+		}
+	}
+}
+
 // 熔断 3 次 open；open 内不建；30m 后 half-open 只建 1 台；试探成功 closed。
 func TestBreakerLifecycle(t *testing.T) {
 	o, st := bFixture(9 * time.Minute)

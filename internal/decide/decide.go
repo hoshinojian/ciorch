@@ -71,15 +71,38 @@ type Breaker struct {
 // RepoState 是一个仓的跨轮记忆（§3.6.1；事件史字段为 §3.6.5"何时升级为
 // 事故"判据所需：A/C 的"24h 内第 2 次"与 H 的连续失败轮数无法从单轮观察推出）。
 type RepoState struct {
-	Machines           map[string]MachineState
-	Breaker            Breaker
-	CreateBackoffUntil time.Time
-	CreateFailStreak   int
-	LastActivity       []time.Time         // 近 2h job 开跑时间点（自适应空闲），≤20 个
-	RecordedRuns       map[int64]time.Time // LastActivity 已记过的 RunID → 该 run 首个开跑点（跨轮去重，随 2h 窗口淘汰）
-	StallEvents        []time.Time         // 场景 A 触发补救的时刻
-	OfflineEvents      []time.Time         // 场景 C 触发处置的时刻
-	ObserveFailStreak  int                 // 场景 H 连续 Complete=false 轮数
+	Machines             map[string]MachineState
+	Breaker              Breaker
+	CreateBackoffUntil   time.Time
+	CreateFailStreak     int
+	LastActivity         []time.Time         // 近 2h job 开跑时间点（自适应空闲），≤20 个
+	RecordedRuns         map[int64]time.Time // LastActivity 已记过的 RunID → 该 run 首个开跑点（跨轮去重，随 2h 窗口淘汰）
+	RecentProviderErrors []ProviderError     // 最近建机/删机失败原文（诊断材料 recent_vpsctl_errors，≤10 条）
+	StallEvents          []time.Time         // 场景 A 触发补救的时刻
+	OfflineEvents        []time.Time         // 场景 C 触发处置的时刻
+	ObserveFailStreak    int                 // 场景 H 连续 Complete=false 轮数
+}
+
+// ProviderError 是一次建机/删机路径失败的原文（含渲染失败等建机前置错误；
+// 诊断材料 recent_vpsctl_errors 的来源，§3.10.3）。
+type ProviderError struct {
+	At  time.Time
+	Op  string // create | delete
+	Err string
+}
+
+// providerErrorKeep 是 RecentProviderErrors 的保留条数。
+const providerErrorKeep = 10
+
+// RecordProviderError 追加一条 provider 错误并截到最近 providerErrorKeep 条。
+func RecordProviderError(st *RepoState, at time.Time, op string, err error) {
+	if err == nil || st == nil {
+		return
+	}
+	st.RecentProviderErrors = append(st.RecentProviderErrors, ProviderError{At: at, Op: op, Err: err.Error()})
+	if len(st.RecentProviderErrors) > providerErrorKeep {
+		st.RecentProviderErrors = st.RecentProviderErrors[len(st.RecentProviderErrors)-providerErrorKeep:]
+	}
 }
 
 // Params 是决策参数（§3.6.6，零值字段取默认）。
@@ -304,6 +327,7 @@ func cloneState(st RepoState) RepoState {
 	for k, v := range st.RecordedRuns {
 		out.RecordedRuns[k] = v
 	}
+	out.RecentProviderErrors = append([]ProviderError(nil), st.RecentProviderErrors...)
 	out.StallEvents = append([]time.Time(nil), st.StallEvents...)
 	out.OfflineEvents = append([]time.Time(nil), st.OfflineEvents...)
 	return out

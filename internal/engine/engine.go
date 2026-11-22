@@ -314,6 +314,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 			e.removeRunnerByName(ctx, repo, a.DropletName)
 			if err := e.deleteMachine(ctx, obs, a.DropletID); err != nil {
 				e.Log.Printf("[%s] Drain 删机失败: %v", repo.Repo, err)
+				e.noteProviderError(repo.Repo, "delete", err)
 				continue
 			}
 			e.recordDeletion(obs, a.DropletID)
@@ -323,6 +324,7 @@ func (e *Engine) execute(ctx context.Context, repo config.RepoEntry, obs observe
 			// 强删：先删机器再清注册（job 已判死/注册从未成功）
 			if err := e.deleteMachine(ctx, obs, a.DropletID); err != nil {
 				e.Log.Printf("[%s] 强删失败: %v", repo.Repo, err)
+				e.noteProviderError(repo.Repo, "delete", err)
 				continue
 			}
 			e.recordDeletion(obs, a.DropletID)
@@ -359,6 +361,16 @@ func (e *Engine) deleteMachine(ctx context.Context, obs observe.Obs, id string) 
 		return fmt.Errorf("机器 %s 不在本轮观察里，无法路由到池", id)
 	}
 	return e.Providers[pool].Delete(ctx, m.ID)
+}
+
+// noteProviderError 把建机/删机失败原文记入该仓状态（RecentProviderErrors，
+// 诊断材料 recent_vpsctl_errors 的来源；≤10 条，§3.10.3）。
+func (e *Engine) noteProviderError(repo, op string, err error) {
+	e.mu.Lock()
+	st := e.States[repo]
+	decide.RecordProviderError(&st, time.Now(), op, err)
+	e.States[repo] = st
+	e.mu.Unlock()
 }
 
 // noteRemedy 固定逻辑补救已执行（A/B/C/D 场景动作）→ OnRemedy 回调
@@ -401,13 +413,19 @@ func (e *Engine) fireIncident(ctx context.Context, repo config.RepoEntry, a deci
 // create：铸 token → 渲染 cloud-init → 池 Provider 建机（名字由池的 Namer
 // 取、cloud-init 落盘/清理由 Provider 负责）。extra 是本轮已建的机名——
 // 取名基于本轮观察快照，不并入会与同轮先建的机同名（GitHub 拒绝重名注册）。
-// 返回机器名（Gate 占坑沉淀用）。
-func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs, extra []string) (string, error) {
+// 返回机器名（Gate 占坑沉淀用）。任何失败（含渲染等建机前置错误）原文进
+// RecentProviderErrors（诊断材料 recent_vpsctl_errors，§3.10.3）。
+func (e *Engine) create(ctx context.Context, repo config.RepoEntry, obs observe.Obs, extra []string) (name string, err error) {
+	defer func() {
+		if err != nil {
+			e.noteProviderError(repo.Repo, "create", err)
+		}
+	}()
 	p := e.Cfg.ProfileOf(repo)
 	prov := e.poolFor(repo, p).Provider
 	names := machineNames(obs.Machines)
 	names = append(names, extra...)
-	name := prov.Namer().Next(repo.NamePrefix(), names)
+	name = prov.Namer().Next(repo.NamePrefix(), names)
 	ctxTO, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	token, err := e.GH.MintToken(ctxTO, repo.Repo)
