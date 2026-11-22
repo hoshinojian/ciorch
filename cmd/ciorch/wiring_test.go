@@ -131,3 +131,26 @@ func (f *e2eFakeIssues) CloseIssue(ctx context.Context, repo string, number int6
 func (f *e2eFakeIssues) ReopenIssue(ctx context.Context, repo string, number int64) error {
 	return nil
 }
+
+// plan / daemon -dry-run 必须零副作用：事故模块也要 DryRun，否则 D/E/G 等
+// 事故场景会真开 issue、真调 LLM、真执行 LLM 动作（engine dry-run 分支仍
+// fireIncident）。只读装配之外（真 daemon）不得误开 DryRun。
+func TestWiringReadOnlyMarksIncidentsDryRun(t *testing.T) {
+	cfg := &config.Config{
+		StateDir: t.TempDir(),
+		Pools: map[string]config.PoolCfg{"p": {Provider: "vpsctl", MaxMachines: 1,
+			Raw: []byte(`{"bin":"/bin/true","account":"a","region":"sgp1","size":"s","image":"i","hourly_cost_hint":0.1}`)}},
+		Global:   config.GlobalCfg{MaxMachines: 1, DailyBudgetUSD: 1},
+		Profiles: map[string]config.Profile{"g": {Pools: []string{"p"}, RunnersPerDroplet: 1}},
+		Repos:    []config.RepoEntry{{Repo: "o/r", Profile: "g", MaxRunners: 1}},
+	}
+	for _, readOnly := range []bool{true, false} {
+		rt, err := wiring(cfg, "TESTTOKEN123456", readOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rt.incidents.DryRun != readOnly {
+			t.Fatalf("readOnly=%v：incidents.DryRun 应为 %v", readOnly, readOnly)
+		}
+	}
+}
