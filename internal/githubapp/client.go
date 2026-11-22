@@ -35,6 +35,7 @@ type Client struct {
 	// 限流感知。Sleep 与退避可注入（测试）。
 	sleep         func(ctx context.Context, d time.Duration) error
 	bo            []time.Duration // 重试退避序列（默认 0.5s、1.5s）
+	etagMu        sync.Mutex      // daemon 每仓一个 goroutine 共用本 Client
 	etags         map[string]etagEntry
 	rateMu        sync.Mutex
 	rateRemaining int // 最近一次响应的 X-RateLimit-Remaining（-1=未知）
@@ -189,7 +190,9 @@ func (c *Client) fetch(ctx context.Context, repo, path, fullURL string) ([]byte,
 		fullURL = c.baseURL + "/" + path
 	}
 	backoff := append([]time.Duration(nil), c.bo...)
+	c.etagMu.Lock()
 	cached := c.etags[fullURL]
+	c.etagMu.Unlock()
 	token, terr := c.auth(ctx, repo)
 	if terr != nil {
 		return nil, "", fmt.Errorf("取认证 token: %w", terr)
@@ -255,7 +258,9 @@ func (c *Client) fetch(ctx context.Context, repo, path, fullURL string) ([]byte,
 			return result{noRetry: true}, true, fmt.Errorf("GET %s: HTTP %d", path, resp.StatusCode) // 4xx 不重试
 		}
 		if et := resp.Header.Get("ETag"); et != "" {
+			c.etagMu.Lock()
 			c.etags[fullURL] = etagEntry{etag: et, body: raw, link: link}
+			c.etagMu.Unlock()
 		}
 		return result{body: raw, link: link}, true, nil
 	})

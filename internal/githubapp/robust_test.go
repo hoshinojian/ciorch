@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,6 +52,33 @@ func TestNoRetryOn4xx(t *testing.T) {
 	if atomic.LoadInt32(&calls) != 1 {
 		t.Fatalf("4xx 不应重试，got %d 次", calls)
 	}
+}
+
+// ETag 缓存并发安全：daemon 每仓一个 goroutine 共用一个 Client，etags map
+// 被并发读写（裸 map 会 fatal error 崩进程；-race 下必报）。多仓托管才暴露。
+func TestETagCacheConcurrentRepos(t *testing.T) {
+	var n int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, atomic.AddInt64(&n, 1)))
+		w.Write([]byte(`{"total_count":0,"runners":[]}`))
+	}))
+	defer srv.Close()
+	c := NewClient("TESTTOKEN123456", WithBaseURL(srv.URL), WithRetryBackoff(0, 0))
+	zeroSleep(c)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := c.ListRunners(context.Background(), fmt.Sprintf("o/r%d-%d", g, i%3)); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 // ETag 条件请求：304 直接用缓存 body（§8.1）。
