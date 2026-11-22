@@ -1069,6 +1069,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 11 | S6 取消 run 前关了 issue，被编排器重开 | job 仍在排队，同键事故 24h 内复发 | **先取消 run，再关 issue** | S6 |
 | 12 | 一次冒烟 S1/S2 各多等约 45 分钟 | LastActivity bug（#47），不是临时参数问题 | 修 #47；并非靠调阈值提速 | 04 §5 |
 | 13 | 消息发给长任务中的 session 要等对方本轮结束才被读到 | SendToSession 进队列 | 用后台 `sleep` 计时器 + `WaitSessions`；不值得打断时不打断 | 02 §8.2 |
+| 14 | 切换后 nms build/lint 由约 1 分钟变为 9–10 分钟，main dispatch run 45051671228 的 build 在 10m06s 被取消 | nms 的 setup-go 缓存 key 恒定（Go 版本 + go.sum），命中不重存：main 作用域那份是 11-15 存的 534MB；当日 DO sgp1 到 GitHub 缓存服务降到 1.0MB/s（15:00 时 12.8MB/s），534MB 恢复要 9 分钟，撞 `timeout-minutes: 10`。**与 ciorch 无关**（该 run 无任何编排动作） | 删 main 旧缓存，下个 main run 自动重存 63MB；验证 run 45054284248 7/7，build 22s、lint 2m12s、test 7m46s，整 run 约 9 分钟。用时再逼近超时先查 setup-go 步骤的 `Cache Size` 与速率 | nms P146（nms#635） |
 
 ### 9.3 GitHub / DO 平台
 
@@ -1138,12 +1139,12 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 1. 本地构建（linux/amd64 静态）：`CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o ciorch.new ./cmd/ciorch`；记下 `sha256sum ciorch.new`。
 2. 确认无活动 run：`gh run list -R hoshinojian/nms --status in_progress` 与 `/status` 的 `N=0`。
 3. `scp ciorch.new root@168.144.104.79:/usr/local/bin/ciorch.new`。
-4. 在编排器上备份旧版：`cp -p /usr/local/bin/ciorch /usr/local/bin/ciorch.bak-<旧sha前12位>`（沿用已有约定；现有备份 `a67b45f677b4`、`e40767506aee`、`5761d103e977`、`d5ace1280b26`）。
+4. 在编排器上备份旧版：`cp -p /usr/local/bin/ciorch /usr/local/bin/ciorch.bak-<旧sha前12位>`（沿用已有约定；现有备份 `a67b45f677b4`、`e40767506aee`、`5761d103e977`、`d5ace1280b26`、`f652ebce1b48`）。
 5. 替换并重启：`mv /usr/local/bin/ciorch.new /usr/local/bin/ciorch && systemctl restart ciorch`。
 6. 验证：`systemctl is-active ciorch`、日志出现各仓 `complete=true`、`curl localhost:8080/healthz` 为 `ok`、`ciorch plan` 输出合理；本机 sha 与远端 `sha256sum` 一致。
 7. 回滚：`cp -p /usr/local/bin/ciorch.bak-<sha12> /usr/local/bin/ciorch && systemctl restart ciorch`。
 
-当前线上二进制：`f652ebce1b48`（含 #54，已包含 #50–#54）。
+当前线上二进制：`1e3b1bacda83`（11-22 17:42 部署，main `17f0bab`，含 #50–#54 与 #56）。
 
 ### 10.3 修改配置
 
@@ -1375,6 +1376,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 20 | `create_backoff_max` 的 tuning 不生效：`RecordCreateResult` 被传入空 `decide.Params{}`（engine.go:277、294） | 建机失败退避封顶恒为 15m，改配置无效 | **未修**（代码问题） | 把 engine 的实际 params 传进去，补测试 |
 | 21 | REDESIGN §5.4 称机器侧用 `pgrep -x`，实际是 `pgrep -f`（无 shell 包裹，不自匹配） | 文档误导 | **未修** | 改 REDESIGN 注记 |
 | 22 | `cirunner diag --lines 200`（空格形式）退出码 2，只有 `--lines=200` 可用 | 人工排障易踩 | **未修** | 改参数分离逻辑或文档 |
+| 23 | SSHAct 偶发 `ssh … exit status 255`（11-22 16:44 对 10.104.0.22 一次） | 当次补救未执行；16:59 同两台机器的 `restart-runner` 与事故证据 `machine_diag`（nms#633）均经 ssh 成功，属偶发连接失败 | **观察中** | 复发再查机器侧 sshd 日志（是否公网扫描占满 MaxStartups）；SSHAct 失败目前只记日志（见 #5） |
 
 #### C. 未修：风险（读代码发现，均【推断】）
 
