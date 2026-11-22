@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/hoshinojian/ciorch/internal/decide"
 	"github.com/hoshinojian/ciorch/internal/llm"
+	"github.com/hoshinojian/ciorch/internal/observe"
 )
 
 // LLMClient 是诊断调用面（*llm.Client 实现；测试用假实现——无真实 key）。
@@ -148,19 +150,34 @@ func (m *Manager) diagnoseRound(ctx context.Context, inc *Incident, now time.Tim
 	m.Log.Printf("[incident][%s] 第 %d 轮结论 action=%s：%s", inc.Repo, round, v.Action, result)
 }
 
-// validateContext 组装校验依据（本仓所辖机器 / profile.pools / 可重跑 run）。
+// validateContext 组装校验依据（本仓可下手的机器 / profile.pools / 可重跑 run）。
 func (m *Manager) validateContext(ctx context.Context, inc *Incident, ev EvidenceSource) ValidateContext {
 	vc := ValidateContext{RerunnableRuns: map[int64]bool{}, ProfilePools: m.poolsOf(inc.Repo)}
 	if ev == nil {
 		return vc
 	}
 	if obs, ok := ev.Obs(inc.Repo); ok {
-		for _, mc := range obs.Machines {
-			vc.OwnedMachines = append(vc.OwnedMachines, mc.Name)
-		}
+		vc.OwnedMachines = actionableMachines(obs, ev.RepoState(inc.Repo))
 	}
 	vc.RerunnableRuns = ev.RerunnableRuns(ctx, inc.Repo)
 	return vc
+}
+
+// actionableMachines 返回当前观察里仍在、且未标 Bad、不在删除流程中的机器
+// （verdict 机器类动作的合法目标）。Bad/删除流程标记由决策状态给出——标记
+// 在 decide 当轮即写入内存，不受 lastObs 滞后一个轮询的影响（冒烟 S3：
+// LLM 对已被固定逻辑强删的机器选了 replace_droplet 仍被放行，根因即此）。
+// Remedy=restarting 不算删除流程（假活重启中的机器仍是合法目标）。
+func actionableMachines(obs observe.Obs, st decide.RepoState) []string {
+	var out []string
+	for _, mc := range obs.Machines {
+		ms := st.Machines[mc.Name]
+		if ms.Bad || ms.Remedy == "replacing" || ms.Remedy == "draining" {
+			continue
+		}
+		out = append(out, mc.Name)
+	}
+	return out
 }
 
 // executeAction 执行白名单动作（受执行面约束；§3.10.5）。

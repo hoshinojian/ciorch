@@ -37,6 +37,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0

@@ -50,6 +50,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -106,6 +107,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -145,7 +147,7 @@
         "RunnerName": "",
         "SSHAct": "",
         "IncidentType": "B",
-        "IncidentKey": "ci-nms-team2-ci-sgp1-03",
+        "IncidentKey": "breaker",
         "Reason": "连续冷启失败达上限，熔断打开，停止建机待人工/冷却"
       }
     ],
@@ -173,6 +175,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -193,6 +196,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -225,6 +229,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0
@@ -257,6 +262,7 @@
       "CreateFailStreak": 0,
       "LastActivity": null,
       "RecordedRuns": {},
+      "RecentProviderErrors": null,
       "StallEvents": null,
       "OfflineEvents": null,
       "ObserveFailStreak": 0

@@ -675,6 +675,30 @@ func TestReconcileRejectsInvalidTuning(t *testing.T) {
 	}
 }
 
+// 建机路径任何失败（含渲染这类建机前置错误）原文进 RecentProviderErrors
+// （诊断材料 recent_vpsctl_errors；冒烟 issue #1 盲诊根源，2026-11-21）。
+func TestCreateFailureRecordedAsProviderError(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.MachineAgent = config.MachineAgentCfg{Version: "v0.1.3", SHA256: strings.Repeat("a", 64)}
+	// 公钥含引号 → Render 校验拒绝（真实失败形态）
+	keyFile := filepath.Join(t.TempDir(), "key.pub")
+	os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest 'key'\n"), 0o600)
+	cfg.SSHPublicKeyFiles = []string{keyFile}
+
+	o := observe.Obs{Now: tnow, Complete: true, JobsOK: true, RunnersOK: true, MachinesOK: true}
+	o.Jobs = []observe.Job{{ID: 1, RunID: 1, Status: "queued", CreatedAt: tnow.Add(-time.Minute)}}
+	e := newEngine(t, &fakeGH{}, newFakePool(), &fakeObs{o})
+	e.Renderer = CloudInitRenderer{Agent: cfg.MachineAgent}
+
+	if _, _, err := e.Reconcile(context.Background(), cfg.Repos[0], false); err != nil {
+		t.Fatal(err)
+	}
+	pes := e.StatesSnapshot()[cfg.Repos[0].Repo].RecentProviderErrors
+	if len(pes) != 1 || pes[0].Op != "create" || !strings.Contains(pes[0].Err, "渲染 cloud-init") {
+		t.Fatalf("渲染失败应记为 create 错误原文：%+v", pes)
+	}
+}
+
 // 同一轮的多个 create 必须取名互异：取名基于本轮观察快照，第二个 create
 // 看不到第一个（2026-11-21 S1 冒烟：两台同名，GitHub 拒绝重名注册 →
 // 第二台 cloud-init 失败成僵尸，且状态按名合并使场景 B 看不见它）。

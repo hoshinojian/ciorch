@@ -155,6 +155,11 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 		// 熔断计数（C 不计入）
 		st.Breaker.Fails++
 		if st.Breaker.Fails >= p.BreakerMaxFails || wasHalfOpen {
+			// 事故只在"转入 open 的瞬间"发一次，且按仓级主体（breaker）：
+			// 同轮多台冷启失败（如两台同批超龄）或 open 期间的后续失败
+			// 都不再另开——同一次熔断只开一个 issue（2026-11-21 冒烟 S4
+			// 按机器主体开过 #4/#5 两个）。
+			newlyOpened := st.Breaker.State != "open"
 			st.Breaker.State = "open"
 			st.Breaker.OpenedAt = obs.Now
 			if wasHalfOpen {
@@ -171,8 +176,10 @@ func scenarioB(p Params, st *RepoState, obs observe.Obs, views map[string]*machi
 			} else {
 				st.Breaker.Cooldown = p.BreakerCooldown
 			}
-			emit(Action{Kind: ActIncident, IncidentType: "B", IncidentKey: name,
-				Reason: "连续冷启失败达上限，熔断打开，停止建机待人工/冷却"})
+			if newlyOpened {
+				emit(Action{Kind: ActIncident, IncidentType: "B", IncidentKey: "breaker",
+					Reason: "连续冷启失败达上限，熔断打开，停止建机待人工/冷却"})
+			}
 		}
 	}
 }

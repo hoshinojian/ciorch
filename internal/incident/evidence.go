@@ -39,15 +39,20 @@ type EvidenceSource interface {
 
 // material 是诊断材料（§3.10.3 结构）。
 type material struct {
-	Incident       materialIncident           `json:"incident"`
-	Timeline       []Entry                    `json:"timeline"`
-	RepoState      materialRepoState          `json:"repo_state"`
-	Jobs           []materialJob              `json:"jobs"`
-	Runners        []materialRunner           `json:"runners"`
-	Machines       []materialMachine          `json:"machines"`
-	MachineDiag    map[string]json.RawMessage `json:"machine_diag"`
-	JobLogTail     string                     `json:"job_log_tail"`
-	PreviousRounds []previousRound            `json:"previous_rounds"`
+	Incident    materialIncident           `json:"incident"`
+	Timeline    []Entry                    `json:"timeline"`
+	RepoState   materialRepoState          `json:"repo_state"`
+	Jobs        []materialJob              `json:"jobs"`
+	Runners     []materialRunner           `json:"runners"`
+	Machines    []materialMachine          `json:"machines"`
+	MachineDiag map[string]json.RawMessage `json:"machine_diag"`
+	JobLogTail  string                     `json:"job_log_tail"`
+	// RecentProviderErrors 是最近建机/删机失败原文（含渲染等建机前置错误；
+	// 无此材料的盲诊是冒烟 issue #1/#3 误判的根源，2026-11-21）。
+	RecentProviderErrors []string `json:"recent_vpsctl_errors"`
+	// UnmatchedQueued 是 E 场景的不可满足排队 job（label 组合 + 排队时长）。
+	UnmatchedQueued []materialUnmatched `json:"unmatched_queued"`
+	PreviousRounds  []previousRound     `json:"previous_rounds"`
 }
 
 type materialIncident struct {
@@ -88,6 +93,13 @@ type materialMachine struct {
 	Addr      string    `json:"addr"`
 }
 
+// materialUnmatched 是 E 场景证据：不可满足的排队 job 及其 label 组合与排队时长。
+type materialUnmatched struct {
+	ID        int64    `json:"id"`
+	Labels    []string `json:"labels"`
+	QueuedAge string   `json:"queued_age"`
+}
+
 type previousRound struct {
 	Verdict      *Verdict `json:"verdict,omitempty"`
 	ActionResult string   `json:"action_result"`
@@ -107,6 +119,17 @@ func (m *Manager) buildMaterial(ctx context.Context, inc *Incident, round int, e
 		mat.RepoState = materialRepoState{
 			Q: countQueued(obs), I: countIdle(obs), P: pendingColdStart(st, obs), N: len(obs.Machines),
 			QAge: ageOfOldestQueued(obs), Breaker: st.Breaker, CreateFailStreak: st.CreateFailStreak,
+		}
+		// recent_vpsctl_errors（§3.10.3）：建机/删机失败原文，逐条带时刻与操作
+		for _, pe := range st.RecentProviderErrors {
+			mat.RecentProviderErrors = append(mat.RecentProviderErrors,
+				pe.At.UTC().Format(time.RFC3339)+" "+pe.Op+": "+pe.Err)
+		}
+		// unmatched_queued：E 场景的 label 组合与排队时长
+		for _, j := range obs.UnmatchedQueued {
+			mat.UnmatchedQueued = append(mat.UnmatchedQueued, materialUnmatched{
+				ID: j.ID, Labels: j.Labels, QueuedAge: obs.Now.Sub(j.CreatedAt).String(),
+			})
 		}
 		for _, j := range obs.Jobs {
 			mat.Jobs = append(mat.Jobs, materialJob{ID: j.ID, RunID: j.RunID, Status: j.Status, Labels: j.Labels, CreatedAt: j.CreatedAt})

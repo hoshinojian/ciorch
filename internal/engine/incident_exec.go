@@ -62,6 +62,7 @@ func (e *Engine) DrainMachine(ctx context.Context, repo, machineName string) err
 		return fmt.Errorf("机器 %s 的池 %s 未装配", machineName, target.Pool)
 	}
 	if err := pool.Delete(ctx, target.ID); err != nil {
+		e.noteProviderError(repo, "delete", err)
 		return err
 	}
 	if e.Gate != nil {

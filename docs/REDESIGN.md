@@ -433,7 +433,7 @@ type Breaker struct {
 **熔断器**（替代原型的永久停建）：
 
 - closed：正常建机。场景 B 使 `Fails++`；runner 首次 online 使 `Fails=0`。
-- `Fails ≥ breaker_max_fails`(3) → open：停止该仓建机，开事故。
+- `Fails ≥ breaker_max_fails`(3) → open：停止该仓建机，开事故。事故按**仓级主体**（`breaker`）且只在转入 open 的瞬间开一次——同轮多台冷启失败或 open 期间的后续失败不另开（同一次熔断只开一个 issue，2026-11-21 冒烟 S4 教训）。
 - open 持续 `breaker_cooldown`(30m) → half-open：允许 1 台试探建机；它 online → closed 且 `Fails=0`；它冷启失败 → 回 open，冷却时间翻倍（封顶 4h）。
 - 人工关闭对应 issue → 直接 closed、`Fails=0`。
 - CLI `ciorch reset <repo>` 同上。
@@ -548,12 +548,16 @@ waiting-human ──issue 被人关闭──► resolved（并清熔断、解除
   "droplets": [{"name": "...", "created_at": "...", "region": "...", "size": "..."}],
   "machine_diag": { "...": "`cirunner diag --json` 原样输出，ssh 不可达时为 {\"error\": \"...\"}" },
   "job_log_tail": "卡死/失败 job 日志末尾 32KB（如适用）",
-  "recent_vpsctl_errors": ["..."],
+  "recent_vpsctl_errors": ["...", "..."],
+  "unmatched_queued": [{"id": 9, "labels": ["nonexistent-label", "self-hosted"], "queued_age": "6m0s"}],
   "previous_rounds": [{"verdict": {...}, "action_result": "..."}]
 }
 ```
 
 总大小控制在约 100KB 内（超了按 job_log_tail → machine_diag 内的日志段 → timeline 的顺序截断）。
+
+- `recent_vpsctl_errors`：最近 ≤10 次建机/删机路径失败的错误**原文**（逐条 `时刻 op: 错误`），含渲染失败这类发生在 provider 调用**之前**的错误（2026-11-21 冒烟 issue #1 盲诊教训：LLM 看不到错误原文会把编排器自身的 bug 归因为提供商侧）。
+- `unmatched_queued`：E 场景证据——不可满足排队 job 的 label 组合与排队时长（issue #3 教训：材料里只有 Q=0 会让 LLM 把"排队超 5m"当矛盾）。
 
 #### 3.10.4 DeepSeek 调用
 

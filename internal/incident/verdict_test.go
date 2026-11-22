@@ -31,8 +31,8 @@ func TestVerdictValidationDowngrades(t *testing.T) {
 	}{
 		{"未知动作", "", func(v *Verdict) { v.Action = "rm -rf" }, "白名单"},
 		{"场景外动作（A 不许 pause_repo）", "", func(v *Verdict) { v.Action = "pause_repo"; v.ActionArgs = ActionArgs{DurationMin: 60} }, "白名单"},
-		{"机器越权", "", func(v *Verdict) { v.ActionArgs.Machine = "someone-else-01" }, "不是本仓所辖"},
-		{"机器不存在", "", func(v *Verdict) { v.ActionArgs.Machine = "ci-nms-team2-ci-sgp1-99" }, "不是本仓所辖"},
+		{"机器越权", "", func(v *Verdict) { v.ActionArgs.Machine = "someone-else-01" }, "不是本仓可下手"},
+		{"机器不存在", "", func(v *Verdict) { v.ActionArgs.Machine = "ci-nms-team2-ci-sgp1-99" }, "不是本仓可下手"},
 		{"pool 不在白名单", "B", func(v *Verdict) { v.Action = "switch_pool"; v.ActionArgs = ActionArgs{Pool: "do-blr1-c2"} }, "白名单"},
 		{"duration 越下界", "B", func(v *Verdict) { v.Action = "pause_repo"; v.ActionArgs = ActionArgs{DurationMin: 5} }, "[10,360]"},
 		{"duration 越上界", "B", func(v *Verdict) { v.Action = "pause_repo"; v.ActionArgs = ActionArgs{DurationMin: 361} }, "[10,360]"},
