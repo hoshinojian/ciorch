@@ -240,8 +240,10 @@ func (e incidentEvidence) RerunnableRuns(ctx context.Context, repo string) map[i
 
 // wiring 组装真实客户端与执行面：按配置的 pools 从 Registry 构造各池
 // Provider（vpsctl 实现经 init 注册），profile→池解析 = profile.pools[0]
-// （长度 1 由 config 校验强制）。
-func wiring(cfg *config.Config, token string) (*runtime, error) {
+// （长度 1 由 config 校验强制）。readOnly（plan/status/daemon -dry-run）
+// 时事故模块同为 DryRun：engine 的 dry-run 分支仍会 fireIncident，不置位
+// 就会真开 issue、真调 LLM、真执行 LLM 动作。
+func wiring(cfg *config.Config, token string, readOnly bool) (*runtime, error) {
 	rt := &runtime{}
 	if cfg.GitHubApp.AppID != 0 && cfg.GitHubApp.PrivateKeyFile != "" {
 		// GitHub App 生产路径（§3.4.2）：私钥 PEM 加载，按仓铸 installation token
@@ -285,6 +287,7 @@ func wiring(cfg *config.Config, token string) (*runtime, error) {
 	rt.engine = engine.New(cfg, rt.gh, rt.providers, rt.poolOf, sshx{keyFile: cfg.SSHPrivateKeyFile}, engine.CloudInitRenderer{Agent: cfg.MachineAgent}, log.Default())
 	rt.engine.SetCollector(rt.collector)
 	rt.incidents = wireIncidents(cfg, rt)
+	rt.incidents.DryRun = readOnly
 	return rt, nil
 }
 
@@ -354,7 +357,7 @@ func cmdPlan(configPath, token, repoFilter string) error {
 	if err != nil {
 		return err
 	}
-	rt, err := wiring(cfg, token)
+	rt, err := wiring(cfg, token, true)
 	if err != nil {
 		return err
 	}
@@ -382,7 +385,7 @@ func cmdStatus(configPath, token, repoFilter string) error {
 	if err != nil {
 		return err
 	}
-	rt, err := wiring(cfg, token)
+	rt, err := wiring(cfg, token, true)
 	if err != nil {
 		return err
 	}
@@ -431,7 +434,7 @@ func cmdDaemon(configPath, token string, dryRun bool) error {
 	if err != nil {
 		return err
 	}
-	rt, err := wiring(cfg, token)
+	rt, err := wiring(cfg, token, dryRun)
 	if err != nil {
 		return err
 	}
