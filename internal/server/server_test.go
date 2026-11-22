@@ -95,9 +95,9 @@ func TestWebhookWhitelistAndCache(t *testing.T) {
 	if len(triggered) != 1 || triggered[0] != "hoshinojian/nms" {
 		t.Fatalf("应触发该仓: %v", triggered)
 	}
-	snap := d.Cache.Snapshot(time.Now())
-	if len(snap) != 1 || snap[0].Job.ID != 42 || snap[0].Job.Status != "queued" {
-		t.Fatalf("缓存不对: %+v", snap)
+	snap := d.Cache.Snapshot(time.Now(), "hoshinojian/nms")
+	if len(snap) != 1 || snap[0].Job.ID != 42 || snap[0].Job.Status != "queued" || snap[0].Repo != "hoshinojian/nms" {
+		t.Fatalf("缓存不对（须记来源仓）: %+v", snap)
 	}
 }
 

@@ -3,6 +3,7 @@ package observe
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,12 +188,13 @@ func TestWebhookCacheMerge(t *testing.T) {
 		},
 	}
 	cache := NewJobCache()
+	r := repo1().Repo
 	// job 1：webhook 比REST 新（30s 前收到 queued）——不改变结果但走合并路径
-	cache.Put(JobCacheEntry{Job: Job{ID: 1, RunID: 100, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: restTime}, UpdatedAt: now.Add(-30 * time.Second)})
+	cache.Put(JobCacheEntry{Repo: r, Job: Job{ID: 1, RunID: 100, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: restTime}, UpdatedAt: now.Add(-30 * time.Second)})
 	// job 2：只在 webhook 里出现（run 列表尚未反映的刚出现 job）
-	cache.Put(JobCacheEntry{Job: Job{ID: 2, RunID: 101, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: now.Add(-1 * time.Minute)}, UpdatedAt: now.Add(-1 * time.Minute)})
+	cache.Put(JobCacheEntry{Repo: r, Job: Job{ID: 2, RunID: 101, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: now.Add(-1 * time.Minute)}, UpdatedAt: now.Add(-1 * time.Minute)})
 	// job 3：过期（3 小时前）
-	cache.Put(JobCacheEntry{Job: Job{ID: 3, RunID: 102, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: now.Add(-3 * time.Hour)}, UpdatedAt: now.Add(-3 * time.Hour)})
+	cache.Put(JobCacheEntry{Repo: r, Job: Job{ID: 3, RunID: 102, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: now.Add(-3 * time.Hour)}, UpdatedAt: now.Add(-3 * time.Hour)})
 
 	obs, err := collector(gh, newFakePool(), cache).Collect(context.Background(), repo1(), prof())
 	if err != nil {
@@ -207,6 +209,56 @@ func TestWebhookCacheMerge(t *testing.T) {
 	}
 	if ids[3] {
 		t.Fatal("过期缓存条目应丢弃")
+	}
+}
+
+// webhook 缓存按仓隔离：别仓的 job 既不算本仓需求，也不进本仓场景 E。
+// 回归：nms 接管后 nms 的 [self-hosted,ci] 排队 job 混进 sandbox 观察，
+// sandbox profile 满足不了 → sandbox 误开"label 不匹配"事故（sandbox#8）。
+func TestWebhookCacheScopedToRepo(t *testing.T) {
+	cache := NewJobCache()
+	cache.Put(JobCacheEntry{Repo: "hoshinojian/ciorch-sandbox",
+		Job:       Job{ID: 7, RunID: 200, Status: "queued", Labels: []string{"self-hosted", "ci-sandbox"}, CreatedAt: now.Add(-10 * time.Minute)},
+		UpdatedAt: now.Add(-10 * time.Minute)})
+	cache.Put(JobCacheEntry{Repo: "hoshinojian/ciorch-sandbox",
+		Job:       Job{ID: 8, RunID: 200, Status: "queued", Labels: []string{"self-hosted", "ci"}, CreatedAt: now.Add(-10 * time.Minute)},
+		UpdatedAt: now.Add(-10 * time.Minute)})
+
+	obs, err := collector(&fakeGH{}, newFakePool(), cache).Collect(context.Background(), repo1(), prof())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs.Jobs) != 0 {
+		t.Fatalf("别仓 job（即使 label 可满足）不得算本仓需求: %+v", obs.Jobs)
+	}
+	if len(obs.UnmatchedQueued) != 0 {
+		t.Fatalf("别仓 job 不得进本仓场景 E: %+v", obs.UnmatchedQueued)
+	}
+}
+
+// 缓存由 webhook handler（每请求一个 goroutine）写、daemon 轮询读：
+// 必须并发安全（裸 map 并发写会 fatal error 直接崩进程；-race 下必报）。
+func TestJobCacheConcurrentAccess(t *testing.T) {
+	cache := NewJobCache()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(2)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				cache.Put(JobCacheEntry{Repo: "hoshinojian/nms", Job: Job{ID: int64(g*1000 + i), Status: "queued"}, UpdatedAt: now})
+			}
+		}(g)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				_ = cache.Snapshot(now, "hoshinojian/nms")
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(cache.Snapshot(now, "hoshinojian/nms")); got != 8*200 {
+		t.Fatalf("并发写入后应有 %d 条，got %d", 8*200, got)
 	}
 }
 
