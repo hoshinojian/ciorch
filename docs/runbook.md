@@ -95,12 +95,18 @@ runcmd:
 5. ufw 按 `deploy/README.md` 只开 22/80/443。
 6. 回 GitHub App 设置页确认 Webhook URL 无误；仓变量配置：ciorch 仓
    Settings → Secrets and variables → Actions → Variables →
-   `CIORCH_HOST = <ip>.sslip.io`（激活 healthcheck workflow）。
+   `CIORCH_HOST = <ip>.sslip.io`（激活 healthcheck workflow；**必配**——
+   2026-11-21 冒烟 S8 教训：漏配时外检曾被静默跳过且 run 报 success，现已
+   改为缺变量直接红叉，但部署后仍须按下条验证真实探测）。
 7. 验收：
    - `systemctl status ciorch`（active）
    - `curl -s localhost:8080/healthz` → `ok`
    - App 设置页 Recent Deliveries 出现 ping/workflow_job 且验签通过（200）
    - 沙箱仓 dispatch 一个 job → ciorch 日志出现该仓 reconcile 行
+   - **手动 dispatch 一次 healthcheck**（ciorch 仓 Actions → healthcheck →
+     Run workflow）：run 应 success，且点开 "探测编排器 /healthz" 步骤日志
+     确认**确实执行了 curl**（有 `ok` 响应体输出）——没有仓变量时该步骤
+     会以 ::error 红叉失败，监控失效必须看得见
    - `ciorch check-config`（如已实现子命令）或 `plan` 手动核对
 
 ## 三、日常运维

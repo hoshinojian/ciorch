@@ -1,6 +1,7 @@
 # ciorch 健康外检（REDESIGN §3.15）：GitHub 托管 runner 每小时探 /healthz，
 # 失败开 issue（复用 ciorch-down 标签的 open issue 追加评论）。
 # 公开仓托管分钟数不计费。60 天无活动 schedule 会被 GitHub 停用（runbook 有注记）。
+# 监控本身失效必须看得见：vars.CIORCH_HOST 未配置 → job 失败（红），不静默跳过。
 name: healthcheck
 
 on:
@@ -22,9 +23,8 @@ jobs:
           CIORCH_HOST: ${{ vars.CIORCH_HOST }}
         run: |
           if [ -z "$CIORCH_HOST" ]; then
-            echo "::notice::vars.CIORCH_HOST 未配置，跳过（部署后在仓库 Settings → Secrets and variables → Actions → Variables 添加，如 203.0.113.10.sslip.io）"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::vars.CIORCH_HOST 未配置，外检无法执行（部署后在仓库 Settings → Secrets and variables → Actions → Variables 添加，如 203.0.113.10.sslip.io；步骤见 docs/runbook.md 部署清单）"
+            exit 1
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           if curl -fsS --max-time 20 "https://$CIORCH_HOST/healthz"; then
@@ -41,6 +41,9 @@ jobs:
           HOST: ${{ vars.CIORCH_HOST }}
           HTTP: ${{ steps.probe.outputs.http }}
         run: |
+          # label 不存在则自建（部署不该依赖人工预建 label；已存在则忽略）
+          gh label create ciorch-down --repo "$GITHUB_REPOSITORY" \
+            --description "编排器宕机外检" --color d73a4a 2>/dev/null || true
           ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ciorch-down --state open --json number --jq '.[0].number // empty')
           body="健康外检失败：https://$HOST/healthz（HTTP $HTTP，$ts UTC）。编排器可能挂了或 healthz 判据过期（3×poll_idle 无完整 reconcile）。"
