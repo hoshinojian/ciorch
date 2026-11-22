@@ -1,7 +1,7 @@
 # CI 执行面全景交接手册（ciorch / cirunner / ciorch-sandbox）
 
 > 起草日期：2026-11-22（UTC）。读者：维护者 hoshinojian，以及日后接手的大模型。
-> 状态：nms 已于 2026-11-22 切换到 ciorch 托管；24 小时观察期进行中，结论与收尾事项见 §12 的 TODO 小节。
+> 状态：nms 已于 2026-11-22 切换到 ciorch 托管，并经真实 PR 场景验证通过（§8.9、§12.2）；收尾见 §12.3。
 > 事实来源：5 份调研素材（起源、总协调、实现、部署冒烟、架构）+ ciorch/docs 下四份文档 + 协调者亲自核实的切换事实。素材冲突时以代码与 gh 实查为准，并在文中注明。
 > 红线：本文不含任何密钥、私钥、token、webhook secret、API key 内容，只写文件路径。
 
@@ -74,8 +74,8 @@
 
 - **nms 的 CI 已由 ciorch 托管**：2026-11-22 07:23–07:24 UTC 完成切换（备份配置、加 pool/profile/repo、停原型、重启 ciorch），首个 nms CI（run 44998142282）7 个 job 全 success，覆盖率棘轮 89.3% ≥ 基线 89.1%（出处：协调者亲自核实）。
 - 切换后发现并修复了 5 个隐患：ciorch PR #50（webhook job 缓存跨仓污染 + 并发写 map）、#51（ETag 缓存无锁）、#52（dry-run 仍会开 issue、调 LLM）、#53（diag 退出码 1 时丢证据）、#54（stats 在编排器上无法用 App 认证）。均已合并并部署到编排器。
-- **24 小时观察期进行中**：2026-11-22 08:16 UTC → 2026-11-23 08:16 UTC，由 WSL 脚本每 30 分钟记录。**观察期结论与收尾事项尚未完成**，见 §12.2、§12.3 的 TODO，本文不编造结果。
-- 原型调度器（WSL 上的 `cirunner-proto`）已 `disable --now`，**只停不删**，作为回滚路径保留。
+- **验证通过**：维护者 11-22 决定不等自然 PR，改由独立 session 造真实测试 PR（nms #627–#631）覆盖 docs-only、全量 7 job、并发排队、cancel-in-progress、空闲回收，全部符合预期，两仓零事故 issue（§8.9）。观察结论见 §12.2。
+- 原型调度器（WSL 上的 `cirunner-proto`）已 `disable --now`，二进制与单元文件**只停不删**，作为回滚路径保留；cirunner 仓内的原型调度**源码**已由 cirunner PR #7 删除（最后包含原型的提交 `b0225ce`）。
 
 ### 1.2 三个仓、一个沙箱、一个建机工具：一句话定位
 
@@ -298,7 +298,7 @@ cirunner 现在同时存在两部分（代码层面都还在 main 上）：
 | 部分 | 状态 | 谁用它 |
 |---|---|---|
 | `pkg/cloudinit`（库）+ `cmd/cirunner` 的 health/diag/act（机器侧二进制）| **在役** | ciorch 通过 go module 依赖（钉 v0.1.3）；cloud-init 在机器上下载二进制并校验 sha256 |
-| `cmd/cirunner` 的 status/plan/up/down/daemon + `internal/{decide,engine,githubapi,vpsctlapi,config,cloudinit}`（原型调度器）| **已停用，保留作回滚** | 回滚时 `systemctl --user enable --now cirunner`（见 §10.7）；计划在观察期通过后单独 PR 删除（§12.3） |
+| `cmd/cirunner` 的 status/plan/up/down/daemon + `internal/{decide,engine,githubapi,vpsctlapi,config,cloudinit}`（原型调度器）| **源码已删除**（cirunner PR #7；最后版本 `b0225ce`）；WSL 上的二进制与单元文件保留作回滚 | 回滚时 `systemctl --user enable --now cirunner`（见 §10.7），不依赖仓内当前代码 |
 
 注意：`pkg/cloudinit` 是**复制**迁出，不是移动；原型 engine 仍用 `internal/cloudinit` 版本，两份会随时间分叉，这是有意为之（在役原型是钉死副本）。
 
@@ -998,6 +998,23 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 
 均 CI 全绿后合并。
 
+### 8.9 真实 PR 场景验证（2026-11-22 13:45–16:03，代替被动等待）
+
+维护者判断"等协作者自然推 PR"等不及，要求另开 session 造测试（`sess_4a544768…`，报告 `/tmp/ciorch-citest-report.md`，协调者已用 gh/vpsctl 独立复核 PR 状态、run 结论、机器与注册清零、无事故 issue、main 未动）。5 个 draft 测试 PR（nms #627–#631，均已关闭未合并、分支已删），7 个 run / 8 次 attempt：
+
+| 场景 | run | 结果 | 要点 |
+|---|---|---|---|
+| S1 docs-only（#143） | 45029806937 | success，5m43s | test 日志 `docs_only=true`，test 1m47s；run 创建→建机 15–20s，→首 job 2m25s；13:53:23 一次「场景 F 全局配额 3/3」瞬态（2 台实机 + 1 个未过 TTL 的占坑），下一轮自愈 |
+| S2 代码 PR 全量 | 45030705550 | attempt 1 test 失败（P145 偶发），`rerun --failed` 后 success | S1 的热机 3 秒接活，零建机等待；覆盖率 artifact 已上传 |
+| S3 并发 2 PR + 第 3 个 | 45033783948 / 45033828909 / 45033977076 | b 失败（同一 P145 偶发）、c success、d 排队 | 21 个 job 在场时机器恒为 2 台，未建第 3 台 |
+| S4 同分支连推 | 45033977076→45035675125 | 旧 run cancelled，新 run success | 取消前后日志 `actions=[无]`，无 Bad 判定、无误删 |
+| S5 空闲回收 | — | 15:45:59 回收 -01、15:55:43 回收 -02 | 近 2h 不同 RunID ≥2 → 45 分钟档；一轮一台；之后 droplets=0、runner 注册=0 |
+| S6 事故 issue | — | 两仓零新增 | `gh issue list --author 'ciorch[bot]'` |
+
+机器峰值 2（≤ max_runners 2、≤ 全局 3）；Breaker 全程 closed；本次增量花费约 $0.55（当日累计 $0.98）。两次失败都是 nms 测试自身的偶发（同 run 其余 6 job 绿、机器正常），已记为 nms pitfalls **P145**：夹具时间写死 2026-11-11 + migration 0022 的 24h retention，bgw 在插入与查询之间删 chunk。
+
+测试方另报两点环境现象：WSL 出网间歇大面积丢包（gh 超时，经编排器 SOCKS 隧道绕过；编排器自身不受影响）；从 WSL 访问外部 healthz 偶发超时，协调者 16:07 复测为 200。
+
 ## 9. 踩坑大全
 
 > 格式：现象 → 根因 → 解法 → 出处。分四类：产品代码、部署运维、GitHub/DO 平台、多 session 协作与工具。nms 侧通用 CI 坑见 nms `docs/engineering/pitfalls.md`（动手前先查，别踩已归档的坑）。
@@ -1221,7 +1238,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 
 ### 10.10 观察期脚本与唤醒条件
 
-脚本：WSL `~/.local/state/ciorch-observe/observe.sh`，日志同目录 `observe.log`；每 30 分钟记录：healthz、`/status`（nms Q/N/机器数/熔断）、ciorch 名下 droplet 数、当日花费、观察窗内 `ciorch[bot]` 开的 issue、新完成的 nms run 结论。**任一异常即退出唤醒协调者**：healthz 连续 2 次非 200、熔断非 closed、机器 >3、出现 ciorch 事故 issue、nms run 非 success/cancelled。结论与收尾见 §12.2、§12.3。
+脚本：WSL `~/.local/state/ciorch-observe/observe.sh`，日志同目录 `observe.log`；每 30 分钟记录：healthz、`/status`（nms Q/N/机器数/熔断）、ciorch 名下 droplet 数、当日花费、观察窗内 `ciorch[bot]` 开的 issue、新完成的 nms run 结论。**任一异常即退出唤醒协调者**：healthz 连续 2 次非 200、熔断非 closed、机器 >3、出现 ciorch 事故 issue、nms run 非 success/cancelled。实际：14:49 因 run 45033783948（P145 测试偶发）触发退出，经核实非执行面问题，未再重启；结论见 §12.2。
 
 ## 11. 多 session 协作模式回顾
 
@@ -1238,6 +1255,7 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 写码 B（S2） | `sess_60855587…` | Provider 抽象、阶段 5 事故管线、#39 审查修复 | 11-21 10:46 → 14:09 | 同样 15:38 起 `sessionNotFound` |
 | 部署（D） | `sess_2c920fad…` | 建编排器机器、装机、App、webhook、启动、沙箱冒烟准备 | 11-21 15:39 → 16:26 | 因 S1、S2 发送失败而新开 |
 | 冒烟（S） | `sess_1f08eb65…` | S1–S8、冒烟中修复、回归；11-22 被派发切换任务但消息未送达 | 11-21 约 16:25 → 11-22 01:25 | 创建时刻按文本推断（部署 session 派生）【不确定】 |
+| 场景测试（T） | `sess_4a544768…` | 切换后造 5 个测试 PR 验证真实 PR 场景（§8.9），只取证不改配置 | 11-22 13:45 → 16:03 | 由新协调创建；报告经协调者独立复核 |
 
 维护者本人：只做决策与少量 GitHub 网页操作（创建 App、生成私钥、安装 App、填 webhook、贴 DeepSeek key），并在早期把写码 session 的交付以 `.zcode-session` 文件路径转给协调者。
 
@@ -1374,29 +1392,26 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 其他 | `runners_per_droplet=2` 代码路径写了但从未真机验证 | 默认关；打开前须在沙箱对比 ≥20 个 run | **未验证** | 维护者决定 |
 | 其他 | 多池调度未实现：`profile.pools` 强制长度 1；`switch_pool` 不可用 | 只有一个池可选 | **设计限制** | 见 §12.5 |
 
-### 12.2 观察期 TODO（尚未完成）
+### 12.2 观察期结论
 
-观察窗口：**2026-11-22 08:16 UTC → 2026-11-23 08:16 UTC**。机制见 §10.10。
+观察窗口原定 **2026-11-22 08:16 UTC → 2026-11-23 08:16 UTC**（机制见 §10.10），后改为主动场景测试收口（§8.9）。
 
-- **TODO：观察期结论。** 本文起草时观察期仍在进行，**没有结论，也没有编造任何结果**。待补内容：
-  - 观察窗口内 `observe.log` 的总体判断：healthz 是否连续 200、熔断是否一直 closed、机器数最大值、当日花费最大值、有无 `ciorch[bot]` 开的 issue、窗口内新完成的 nms run 数与结论（含是否有 PR 触发的真实 run）；
-  - 是否触发过唤醒（及原因）；
-  - 与阶段 1 基线的对比（`ciorch stats -repo hoshinojian/nms -since 7d`：排队等待 p50/p95、冷启、run 总时长）；
-  - 是否需要延长观察期（REDESIGN §9 阶段 6 原定「观察 3 天」，协调者切换方案改为 24 小时，**两者口径不同**，以维护者最终决定为准）。
-  - 填写位置：本小节下方；填写人：协调者或维护者。
+  > **观察期结论（2026-11-22 16:10 UTC，协调者）：通过。**
+  > - 被动观察：`observe.log` 08:17–14:49 共 14 次采样，healthz 全部 200、熔断全部 closed、机器峰值 2、ciorch 事故 issue 0。脚本于 14:49 因 run 45033783948 结论 failure 触发唤醒条件而退出——经核实是 nms 测试偶发（P145），非执行面问题；按维护者"测试没问题就可以"的决定，不再重启 24h 窗口。
+  > - 主动验证：§8.9 六个场景全部符合预期（docs-only 快速放行、全量 7 job、并发上限与排队、cancel-in-progress、45 分钟档回收归零、零事故 issue）。
+  > - 当日花费累计 $0.98（远低于 $8 上限）。
+  > - 未覆盖：REDESIGN §9 阶段 6 原定"观察 3 天、无未处理事故"，本次以主动场景测试替代时长；后续真实 PR 若暴露问题，按 §10 处理，必要时按 §10.7 回滚。
 
-  > 观察期结论：（待补）
-
-### 12.3 收尾 TODO（观察期通过后）
+### 12.3 收尾事项
 
 | # | 事项 | 仓 | 状态 | 链接 |
 |---|---|---|---|---|
-| 1 | **nms runbook 更新为 ciorch 口径**：`docs/runbooks/gitrunner.md` 现仍写「cirunner 原型按需建机、守护在维护者 WSL」 | nms | TODO | （待补 PR 链接） |
-| 2 | **nms 决策台账新增一条**：切换到 ciorch 托管。须按台账「取号说明」查末条按序取号，禁止预留编号；引用 #145、#151；说明规格钉死 c2-4vcpu-8gb/sgp1 不变；风险口径 | nms | TODO | （待补） |
-| 3 | **nms pitfalls 补记**：原型缺陷 #2（job 永久卡住）；以及 ciorch 侧值得记入的坑（§9）。同时考虑给 2026-11-15「GitHub API/rollup 显示怪象族」条补正式编号（见 §13.4） | nms | TODO | （待补） |
-| 4 | 修正 nms 中过时口径：`nmsdocs/12-大模型开发标准.md` §五（行 114、127）仍写 `gitrunner-sgp1`、机器掉线=CI 停摆、`./internal/...` 覆盖率范围；台账 #145 原文写 `gitrunner-sgp1`/s-2vcpu-4gb 未改 | nms | TODO（文档漂移） | （待补） |
-| 5 | **原型调度代码退役**：在 cirunner 单独 PR 删除 `internal/{decide,engine,githubapi,vpsctlapi,config}`、`cmd/cirunner` 的 status/plan/up/down/daemon，只留机器侧；同时处理 `internal/cloudinit`（与 `pkg/cloudinit` 的两份） | cirunner | TODO | （待补 PR 链接） |
-| 6 | 原型文件清盘（**仅在观察期通过且确认不再回滚后**）：`~/.local/bin/cirunner-proto`、`~/.config/systemd/user/cirunner.service`、`~/.config/cirunner/`、`~/.local/state/cirunner/`；注意这些是回滚路径，**5 之前不要删** | 维护者 WSL | TODO | — |
+| 1 | **nms runbook 更新为 ciorch 口径**：`docs/runbooks/gitrunner.md` 现仍写「cirunner 原型按需建机、守护在维护者 WSL」 | nms | 已提 PR | [nms#632](https://github.com/hoshinojian/nms/pull/632) |
+| 2 | **nms 决策台账新增一条**：切换到 ciorch 托管。须按台账「取号说明」查末条按序取号，禁止预留编号；引用 #145、#151；说明规格钉死 c2-4vcpu-8gb/sgp1 不变；风险口径 | nms | 已提 PR（决策 #153） | [nms#632](https://github.com/hoshinojian/nms/pull/632) |
+| 3 | **nms pitfalls 补记**：原型缺陷 #2（job 永久卡住）；以及 ciorch 侧值得记入的坑（§9）。同时考虑给 2026-11-15「GitHub API/rollup 显示怪象族」条补正式编号（见 §13.4） | nms | 部分完成：新增 P145（retention 夹具偶发）；原型缺陷与「怪象族」补号未做 | [nms#632](https://github.com/hoshinojian/nms/pull/632) |
+| 4 | 修正 nms 中过时口径：`nmsdocs/12-大模型开发标准.md` §五（行 114、127）仍写 `gitrunner-sgp1`、机器掉线=CI 停摆、`./internal/...` 覆盖率范围；台账 #145 原文写 `gitrunner-sgp1`/s-2vcpu-4gb 未改 | nms | 部分完成：§五 执行面条目已改；行 114 覆盖率范围与 #145 原文按台账惯例不改（由 #151/#153 修订） | [nms#632](https://github.com/hoshinojian/nms/pull/632) |
+| 5 | **原型调度代码退役**：在 cirunner 单独 PR 删除 `internal/{decide,engine,githubapi,vpsctlapi,config}`、`cmd/cirunner` 的 status/plan/up/down/daemon，只留机器侧；同时处理 `internal/cloudinit`（与 `pkg/cloudinit` 的两份） | cirunner | 已提 PR（含 internal/cloudinit、示例配置、systemd 单元） | [cirunner#7](https://github.com/hoshinojian/cirunner/pull/7) |
+| 6 | 原型文件清盘（**维护者确认不再需要回滚后**）：`~/.local/bin/cirunner-proto`、`~/.config/systemd/user/cirunner.service`、`~/.config/cirunner/`、`~/.local/state/cirunner/`；注意这些是回滚路径 | 维护者 WSL | 待维护者决定 | — |
 | 7 | 现场遗留清理：`~/ciorch-s5` worktree（分支 `fix/incident-review-round1`，已合并）；cirunner 仓 `docs/` 未跟踪的旧 REDESIGN.md（915 行，以 ciorch 仓副本为准）；`ciorch-shadow.service` 单元文件；WSL 上 `shadow.token` / `app.pem` 副本（R9） | 维护者 WSL | 待维护者决定 | — |
 | 8 | REDESIGN §9 阶段 6 的收尾描述与本手册对齐；ciorch README 更新（B-15）；runbook/smoke 去掉不存在的命令引用（B-1） | ciorch | TODO | — |
 | 9 | 凭据轮换（§10.9）：DeepSeek key、webhook secret | 编排器 + GitHub App | TODO，建议尽快 | — |
@@ -1610,7 +1625,8 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | 写码 B（S2） | `sess_60855587-7e55-4b21-aba7-bda9339ef529` | 「ciorch 机器提供商抽象」+ 阶段 5 事故管线 | 11-21 10:46 → 14:09 |
 | 部署（D） | `sess_2c920fad-58de-4573-9120-8e66d212778c` | 「ciorch 部署（编排器机器 + 沙箱冒烟）」 | 11-21 15:39 → 16:26 |
 | 冒烟（S） | `sess_1f08eb65-0456-498a-8405-98fd607b7829` | 「ciorch 冒烟 S1–S8（沙箱）」，冒烟、修复、回归 | 11-21 约 16:25 → 11-22 01:25 |
-| 新协调 | `sess_0afeb411-2b87-4d01-a73e-bbbd8c55ed6c` | 11-22 接手：亲自执行 nms 切换、修 #50–#54、起草本文 | 11-22 07:14 起 |
+| 新协调 | `sess_0afeb411-2b87-4d01-a73e-bbbd8c55ed6c` | 11-22 接手：亲自执行 nms 切换、修 #50–#54、起草本文、收尾 PR（nms#632、cirunner#7） | 11-22 07:14 起 |
+| 场景测试 | `sess_4a544768-7985-435c-b212-31735c34ae0d` | 「nms CI 切换 ciorch 后真实 PR 场景测试」 | 11-22 13:45 → 16:03 |
 
 注意：§8.4 的 S1–S8 是**沙箱冒烟场景**，§11 里的 S1/S2 是**写码 session**，二者无关。
 
@@ -1657,4 +1673,4 @@ ufw：默认拒入，只放行 22 / 80 / 443（v4+v6）。
 | `.bak-<sha12>` | 编排器上旧二进制备份命名约定 |
 | 观察期 | 2026-11-22 08:16 → 11-23 08:16 UTC，见 §12.2 |
 
---- 手册结束。观察期结论与收尾 PR 链接待补，见 §12.2、§12.3。 ---
+--- 手册结束。 ---
