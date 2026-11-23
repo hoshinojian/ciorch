@@ -671,3 +671,5 @@ func parseWindow(s string) (time.Duration, error) {
 	}
 	return d, nil
 }
+
+// ci acceptance probe 20261123（验收用，不合并）
